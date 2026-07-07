@@ -44,8 +44,8 @@ KAIROS_INIT_IMAGE="quay.io/kairos/kairos-init"   # kairos-init tool
 KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
-# Script version — auto-updated by pre-commit hook; corresponds to git short hash
-SCRIPT_VERSION="f0fc490"
+# Script version — bump manually when making changes; compared against VERSION file in repo
+SCRIPT_VERSION="1.0.0"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -843,17 +843,17 @@ check_kairos_version() {
 check_script_version() {
     print_info "Local script version: ${SCRIPT_VERSION}"
 
-    # Fetch latest commit SHA from GitHub main branch (short hash, 7 chars)
-    local remote_sha
-    remote_sha=$(curl -s --connect-timeout 5 \
-        "https://api.github.com/repos/Kube-Link/k0s_script/commits/master" 2>/dev/null \
-        | grep -m1 '"sha"' | head -1 | cut -d'"' -f4 | cut -c1-7)
+    # Fetch VERSION file from repo to compare
+    local remote_version
+    remote_version=$(curl -s --connect-timeout 5 \
+        "https://raw.githubusercontent.com/Kube-Link/k0s_script/master/VERSION" 2>/dev/null \
+        | head -1 | tr -d '[:space:]')
 
-    if [ -n "$remote_sha" ]; then
-        if [ "${SCRIPT_VERSION}" = "${remote_sha}" ]; then
-            print_successful "✓ Script is up-to-date (matches main: ${remote_sha})"
+    if [ -n "$remote_version" ]; then
+        if [ "${SCRIPT_VERSION}" = "${remote_version}" ]; then
+            print_successful "✓ Script is up-to-date (v${remote_version})"
         else
-            print_warning "✗ Script is OUTDATED! Local: ${SCRIPT_VERSION} → Remote: ${remote_sha}"
+            print_warning "✗ Script is OUTDATED! Local: v${SCRIPT_VERSION} → Remote: v${remote_version}"
             print_info "A reboot will pull the latest version."
         fi
     else
