@@ -1,0 +1,14 @@
+#!/bin/bash
+# Pre-commit hook: update SCRIPT_VERSION to current HEAD short hash
+# This runs before each commit, updating the version to match the parent commit.
+
+SHORT_HASH=$(git rev-parse --short HEAD 2>/dev/null)
+if [ -n "$SHORT_HASH" ]; then
+    # Update SCRIPT_VERSION in the script file (macOS and Linux compatible)
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        sed -i '' "s/^SCRIPT_VERSION=\".*\"/SCRIPT_VERSION=\"$SHORT_HASH\"/" kairos_k0s_cluster_manager.sh
+    else
+        sed -i "s/^SCRIPT_VERSION=\".*\"/SCRIPT_VERSION=\"$SHORT_HASH\"/" kairos_k0s_cluster_manager.sh
+    fi
+    git add kairos_k0s_cluster_manager.sh
+fi

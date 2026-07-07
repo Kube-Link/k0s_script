@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — auto-updated by pre-commit hook; corresponds to git short hash
-SCRIPT_VERSION="24daca5"
+SCRIPT_VERSION="f0fc490"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
