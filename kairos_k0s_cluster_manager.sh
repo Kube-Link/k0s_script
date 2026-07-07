@@ -308,7 +308,7 @@ stages:
   boot:
     - name: "Update cluster manager script (every boot)"
       commands:
-        - curl -sL https://raw.githubusercontent.com/Kube-Link/K3S_setupscript/main/kairos_k0s_cluster_manager.sh -o /root/kairos-cluster-manager.sh
+        - curl -sL https://raw.githubusercontent.com/Kube-Link/k0s_script/master/kairos_k0s_cluster_manager.sh -o /root/kairos-cluster-manager.sh
         - chmod +x /root/kairos-cluster-manager.sh
 # Longhorn requirement
   boot.after:
@@ -442,7 +442,7 @@ stages:
   boot:
     - name: "Update cluster manager script (every boot)"
       commands:
-        - curl -sL https://raw.githubusercontent.com/Kube-Link/K3S_setupscript/main/kairos_k0s_cluster_manager.sh -o /root/kairos-cluster-manager.sh
+        - curl -sL https://raw.githubusercontent.com/Kube-Link/k0s_script/master/kairos_k0s_cluster_manager.sh -o /root/kairos-cluster-manager.sh
         - chmod +x /root/kairos-cluster-manager.sh
 # Longhorn requirement + set hostname
   initramfs:
@@ -665,7 +665,7 @@ stages:
   boot:
     - name: "Update cluster manager script (every boot)"
       commands:
-        - curl -sL https://raw.githubusercontent.com/Kube-Link/K3S_setupscript/main/kairos_k0s_cluster_manager.sh -o /root/kairos-cluster-manager.sh
+        - curl -sL https://raw.githubusercontent.com/Kube-Link/k0s_script/master/kairos_k0s_cluster_manager.sh -o /root/kairos-cluster-manager.sh
         - chmod +x /root/kairos-cluster-manager.sh
 # Set hostname and etcd peerAddress from this node's IP (not known until boot)
   initramfs:
@@ -846,7 +846,7 @@ check_script_version() {
     # Fetch latest commit SHA from GitHub main branch (short hash, 7 chars)
     local remote_sha
     remote_sha=$(curl -s --connect-timeout 5 \
-        "https://api.github.com/repos/Kube-Link/K3S_setupscript/commits/main" 2>/dev/null \
+        "https://api.github.com/repos/Kube-Link/k0s_script/commits/master" 2>/dev/null \
         | grep -m1 '"sha"' | head -1 | cut -d'"' -f4 | cut -c1-7)
 
     if [ -n "$remote_sha" ]; then
@@ -859,7 +859,7 @@ check_script_version() {
     else
         print_warning "Could not reach GitHub to check latest version."
     fi
-    print_info "Source: https://github.com/Kube-Link/K3S_setupscript/blob/main/kairos_k0s_cluster_manager.sh"
+    print_info "Source: https://github.com/Kube-Link/k0s_script/blob/master/kairos_k0s_cluster_manager.sh"
 }
 
 check_cluster_status() {
