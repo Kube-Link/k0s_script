@@ -1,0 +1,4 @@
+# Configuration files (contains sensitive data like IPs and keys)
+*.cfg
+*.yaml
+*.yml
