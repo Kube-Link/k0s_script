@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.2"
+SCRIPT_VERSION="1.0.3"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -675,6 +675,8 @@ write_files:
             disabled: true
         storage:
           type: etcd
+          etcd:
+            peerAddress: PEER_ADDRESS_PLACEHOLDER
         controllerManager: {}
         scheduler: {}
         telemetry:
@@ -722,7 +724,7 @@ stages:
           OCTET=\$(echo \$IP | cut -d. -f4)
           hostnamectl set-hostname ${CLUSTER_NAME}-ctrl-\${OCTET}
           if [ -n "\$IP" ]; then
-            sed -i "/^        storage:/a\\          etcd:\\n            peerAddress: \$IP" ${K0S_CONFIG_PATH}
+            sed -i "s/PEER_ADDRESS_PLACEHOLDER/\$IP/" ${K0S_CONFIG_PATH}
           fi
   boot.after:
     - name: "Enable iSCSI"
