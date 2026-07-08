@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.3"
+SCRIPT_VERSION="1.0.4"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -664,9 +664,12 @@ write_files:
         name: ${CLUSTER_NAME}
       spec:
         api:
-          address: ${CONTROLLER_IP}
-          externalAddress: ${CONTROLLER_IP}
+          address: NODE_ADDRESS_PLACEHOLDER
+          externalAddress: NODE_ADDRESS_PLACEHOLDER
           port: 6443
+          sans:
+            - ${CONTROLLER_IP}
+            - NODE_ADDRESS_PLACEHOLDER
         network:
           provider: custom
           podCIDR: ${POD_CIDR}
@@ -724,7 +727,7 @@ stages:
           OCTET=\$(echo \$IP | cut -d. -f4)
           hostnamectl set-hostname ${CLUSTER_NAME}-ctrl-\${OCTET}
           if [ -n "\$IP" ]; then
-            sed -i "s/PEER_ADDRESS_PLACEHOLDER/\$IP/" ${K0S_CONFIG_PATH}
+            sed -i "s/PEER_ADDRESS_PLACEHOLDER/\$IP/g; s/NODE_ADDRESS_PLACEHOLDER/\$IP/g" ${K0S_CONFIG_PATH}
           fi
   boot.after:
     - name: "Enable iSCSI"
