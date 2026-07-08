@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.1"
+SCRIPT_VERSION="1.0.2"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -57,12 +57,43 @@ DEFAULT_CLUSTER_NAME="homelab"
 # -----------------------------------------------------------------------------
 generate_config_file() {
     print_info "Generating Kairos/k0s config file..."
-    read -p "Enter controller IP: " CONTROLLER_IP
-    echo "CONTROLLER_IP=$CONTROLLER_IP" > "$CONFIG_FILE"
+    echo ""
 
-    read -p "Enter worker IPs (comma-separated): " WORKERS_INPUT
-    IFS=',' read -ra WORKERS <<< "$WORKERS_INPUT"
-    echo "WORKERS=(${WORKERS[@]})" >> "$CONFIG_FILE"
+    # --- Cluster topology ---
+    # k0s etcd requires odd number of controllers; 3 is the practical HA choice
+    CONTROLLER_COUNT=3
+    echo "CONTROLLER_COUNT=$CONTROLLER_COUNT" > "$CONFIG_FILE"
+
+    print_info "Cluster topology (3-controller HA):"
+    print_info "  Option A: 3 controllers + X workers  — dedicated control plane"
+    print_info "  Option B: 3 controller+workers        — controllers also run pods"
+    echo ""
+
+    # --- Controller role ---
+    read -p "Enable worker role on controllers? (y/n, default: y): " CONTROLLER_WORKER
+    CONTROLLER_WORKER=${CONTROLLER_WORKER:-y}
+    echo "CONTROLLER_WORKER=$CONTROLLER_WORKER" >> "$CONFIG_FILE"
+
+    read -p "Enter primary controller IP: " CONTROLLER_IP
+    echo "CONTROLLER_IP=$CONTROLLER_IP" >> "$CONFIG_FILE"
+
+    print_info "Enter the 2 additional HA controller IPs (these will join the cluster)."
+    read -p "Additional controller IPs (comma-separated): " ADDITIONAL_INPUT
+    IFS=',' read -ra ADDITIONAL_CONTROLLERS <<< "$ADDITIONAL_INPUT"
+    if [ "${#ADDITIONAL_CONTROLLERS[@]}" -ne 2 ]; then
+        print_error "Exactly 2 additional controller IPs required for HA (3 total)."
+        return 1
+    fi
+    echo "ADDITIONAL_CONTROLLERS=(${ADDITIONAL_CONTROLLERS[@]})" >> "$CONFIG_FILE"
+
+    if [ "$CONTROLLER_WORKER" = "y" ]; then
+        echo "WORKERS=()" >> "$CONFIG_FILE"
+        print_info "Controllers will run workloads — no separate workers needed."
+    else
+        read -p "Enter worker IPs (comma-separated): " WORKERS_INPUT
+        IFS=',' read -ra WORKERS <<< "$WORKERS_INPUT"
+        echo "WORKERS=(${WORKERS[@]})" >> "$CONFIG_FILE"
+    fi
 
     read -p "Enter cluster name (default: $DEFAULT_CLUSTER_NAME): " CLUSTER_NAME
     CLUSTER_NAME=${CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}
@@ -288,7 +319,10 @@ write_files:
   - path: /root/kairos_k0s_config.cfg
     permissions: "0644"
     content: |
+      CONTROLLER_COUNT=${CONTROLLER_COUNT}
       CONTROLLER_IP=${CONTROLLER_IP}
+      CONTROLLER_WORKER=${CONTROLLER_WORKER}
+      ADDITIONAL_CONTROLLERS=(${ADDITIONAL_CONTROLLERS[@]})
       WORKERS=(${WORKERS[@]})
       CLUSTER_NAME=${CLUSTER_NAME}
       POD_CIDR=${POD_CIDR}
@@ -354,7 +388,7 @@ generate_worker_cloudconfig() {
 
     local WORKER_TOKEN="$1"
     if [ -z "$WORKER_TOKEN" ]; then
-        print_error "No worker token provided. Run 'Generate Worker Token' first."
+        print_error "No worker token provided."
         return 1
     fi
 
@@ -423,7 +457,10 @@ write_files:
   - path: /root/kairos_k0s_config.cfg
     permissions: "0644"
     content: |
+      CONTROLLER_COUNT=${CONTROLLER_COUNT}
       CONTROLLER_IP=${CONTROLLER_IP}
+      CONTROLLER_WORKER=${CONTROLLER_WORKER}
+      ADDITIONAL_CONTROLLERS=(${ADDITIONAL_CONTROLLERS[@]})
       WORKERS=(${WORKERS[@]})
       CLUSTER_NAME=${CLUSTER_NAME}
       POD_CIDR=${POD_CIDR}
@@ -488,71 +525,77 @@ BUNDLEEOF
 }
 
 # -----------------------------------------------------------------------------
-# Worker token generation
-# -----------------------------------------------------------------------------
-# Runs locally on the controller: `k0s token create --role=worker`.
-# Run this directly on the controller node after SSHing in.
-# The token is needed by generate_worker_cloudconfig() (run on management machine).
+# Worker token + cloud-config — runs on the first controller.
+# Reuses an existing .k0s_worker_token if present; otherwise generates a new one.
+# Always produces worker-cloud-config.yaml.
 generate_worker_token() {
-    print_info "Generating worker join token (runs locally on this node)..."
+    print_info "Generating worker join token + cloud-config..."
 
-    if ! command -v k0s &>/dev/null; then
-        print_error "k0s not found. Are you on the controller node?"
-        return 1
-    fi
-
-    print_info "Running: k0s token create --role=worker"
     local token
-    token=$(k0s token create --role=worker 2>&1)
+    if [ -s .k0s_worker_token ]; then
+        token=$(cat .k0s_worker_token)
+        print_info "Reusing existing worker token from .k0s_worker_token"
+    else
+        if ! command -v k0s &>/dev/null; then
+            print_error "k0s not found. Are you on the controller node?"
+            return 1
+        fi
 
-    if [ -z "$token" ]; then
-        print_error "Failed to create worker token. Is k0s running?"
-        return 1
+        print_info "Running: k0s token create --role=worker"
+        token=$(k0s token create --role=worker 2>&1)
+
+        if [ -z "$token" ]; then
+            print_error "Failed to create worker token. Is k0s running?"
+            return 1
+        fi
+
+        print_successful "Worker token created."
+        echo "$token" > .k0s_worker_token
     fi
 
-    print_successful "Worker token created."
-    echo "$token"
-    echo "$token" > .k0s_worker_token
-    print_info "Token saved to .k0s_worker_token"
-    print_info "Copy this token to your management machine for option 6 (Generate Worker Cloud-Config)."
+    generate_worker_cloudconfig "$token"
 }
 
 # -----------------------------------------------------------------------------
-# Controller join token — runs locally on the controller node.
-# Generates `k0s token create --role=controller` for HA multi-controller setup.
-# Run this directly on the first controller after SSHing in.
+# Controller join token + cloud-config (HA) — runs on the first controller.
+# Reuses an existing .k0s_controller_token if present; otherwise generates a new one.
+# Always produces controller-join-cloud-config.yaml.
 generate_controller_token() {
-    print_info "Generating controller join token (runs locally on this node)..."
+    print_info "Generating controller join token + cloud-config..."
 
-    if ! command -v k0s &>/dev/null; then
-        print_error "k0s not found. Are you on the controller node?"
-        return 1
-    fi
-
-    print_info "Running: k0s token create --role=controller"
     local token
-    token=$(k0s token create --role=controller 2>&1)
+    if [ -s .k0s_controller_token ]; then
+        token=$(cat .k0s_controller_token)
+        print_info "Reusing existing controller token from .k0s_controller_token"
+    else
+        if ! command -v k0s &>/dev/null; then
+            print_error "k0s not found. Are you on the controller node?"
+            return 1
+        fi
 
-    if [ -z "$token" ]; then
-        print_error "Failed to create controller join token. Is k0s running?"
-        return 1
+        print_info "Running: k0s token create --role=controller"
+        token=$(k0s token create --role=controller 2>&1)
+
+        if [ -z "$token" ]; then
+            print_error "Failed to create controller join token. Is k0s running?"
+            return 1
+        fi
+
+        print_successful "Controller join token created."
+        echo "$token" > .k0s_controller_token
     fi
 
-    print_successful "Controller join token created."
-    echo "$token"
-    echo "$token" > .k0s_controller_token
-    print_info "Token saved to .k0s_controller_token"
-    print_info "Copy this token to your management machine for option 4 (Generate Controller Join Cloud-Config)."
+    generate_controller_join_cloudconfig "$token"
 }
 
 # Generates a cloud-config for additional HA controllers that join the cluster.
-# Same as the controller cloud-config but with the join token in /etc/k0s/token.
+# Called automatically by generate_controller_token() (option 3).
 generate_controller_join_cloudconfig() {
     print_info "Generating controller join cloud-config ($CONTROLLER_JOIN_CC_FILE)..."
 
     local CTRL_TOKEN="$1"
     if [ -z "$CTRL_TOKEN" ]; then
-        print_error "No controller join token provided. Run 'Generate Controller Join Token' first."
+        print_error "No controller join token provided."
         return 1
     fi
 
@@ -647,7 +690,10 @@ write_files:
   - path: /root/kairos_k0s_config.cfg
     permissions: "0644"
     content: |
+      CONTROLLER_COUNT=${CONTROLLER_COUNT}
       CONTROLLER_IP=${CONTROLLER_IP}
+      CONTROLLER_WORKER=${CONTROLLER_WORKER}
+      ADDITIONAL_CONTROLLERS=(${ADDITIONAL_CONTROLLERS[@]})
       WORKERS=(${WORKERS[@]})
       CLUSTER_NAME=${CLUSTER_NAME}
       POD_CIDR=${POD_CIDR}
@@ -1547,21 +1593,19 @@ while true; do
     echo -e "\n${YELLOW}======== Kairos + k0s Cluster Management (v${SCRIPT_VERSION}) ========${NC}"
     echo "1.  Generate Config File (settings)"
     echo "2.  Generate Controller Cloud-Config (init)"
-    echo "3.  Generate Controller Join Token (HA)"
-    echo "4.  Generate Controller Join Cloud-Config (HA)"
-    echo "5.  Generate Worker Token"
-    echo "6.  Generate Worker Cloud-Config"
-    echo "7.  Generate Kairos Dockerfile (image build)"
-    echo "8.  Install Cilium"
-    echo "9.  Manage FluxCD"
-    echo "10. Manage BGP Configuration"
-    echo "11. Check Versions (k0s / Kairos)"
-    echo "12. Check Cluster Status"
-    echo "13. Reset Node"
-    echo "14. Rolling OS Upgrade (A/B)"
-    echo "15. Show Config File"
-    echo "16. Setup SSH Keys"
-    echo "17. Exit"
+    echo "3.  Generate Controller Join Token + Cloud-Config (HA)"
+    echo "4.  Generate Worker Token + Cloud-Config"
+    echo "5.  Generate Kairos Dockerfile (image build)"
+    echo "6.  Install Cilium"
+    echo "7.  Manage FluxCD"
+    echo "8.  Manage BGP Configuration"
+    echo "9.  Check Versions (k0s / Kairos)"
+    echo "10. Check Cluster Status"
+    echo "11. Reset Node"
+    echo "12. Rolling OS Upgrade (A/B)"
+    echo "13. Show Config File"
+    echo "14. Setup SSH Keys"
+    echo "15. Exit"
     echo -e "${YELLOW}=================================================${NC}"
     read -p "Enter your choice: " choice
 
@@ -1569,20 +1613,18 @@ while true; do
         1) generate_config_file ;;
         2) ensure_config && generate_controller_cloudconfig ;;
         3) ensure_config && generate_controller_token ;;
-        4) ensure_config && generate_controller_join_cloudconfig "$(cat .k0s_controller_token 2>/dev/null)" ;;
-        5) ensure_config && generate_worker_token ;;
-        6) ensure_config && generate_worker_cloudconfig "$(cat .k0s_worker_token 2>/dev/null)" ;;
-        7) ensure_config && generate_kairos_dockerfile ;;
-        8) ensure_config && install_cilium ;;
-        9) manage_flux ;;
-        10) manage_bgp ;;
-        11) check_script_version; check_k0s_version; check_kairos_version ;;
-        12) check_cluster_status ;;
-        13) reset_node ;;
-        14) kairos_rolling_upgrade ;;
-        15) show_config_file ;;
-        16) setup_ssh_keys ;;
-        17) echo "Exiting..."; exit 0 ;;
+        4) ensure_config && generate_worker_token ;;
+        5) ensure_config && generate_kairos_dockerfile ;;
+        6) ensure_config && install_cilium ;;
+        7) manage_flux ;;
+        8) manage_bgp ;;
+        9) check_script_version; check_k0s_version; check_kairos_version ;;
+        10) check_cluster_status ;;
+        11) reset_node ;;
+        12) kairos_rolling_upgrade ;;
+        13) show_config_file ;;
+        14) setup_ssh_keys ;;
+        15) echo "Exiting..."; exit 0 ;;
         *) print_error "Invalid option." ;;
     esac
 done
