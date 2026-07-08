@@ -2,3 +2,6 @@
 *.cfg
 *.yaml
 *.yml
+
+# Reference scripts (not part of this project)
+ref/

@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.4"
+SCRIPT_VERSION="1.0.5"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -383,33 +383,38 @@ BUNDLEEOF
 }
 
 # Generates the worker cloud-config. Requires a token from the controller.
+# Parameters: $1 = worker token, $2 = worker node IP (optional, for per-node hostname)
 generate_worker_cloudconfig() {
-    print_info "Generating worker cloud-config ($WORKER_CC_FILE)..."
-
     local WORKER_TOKEN="$1"
+    local NODE_IP="$2"
+
     if [ -z "$WORKER_TOKEN" ]; then
         print_error "No worker token provided."
         return 1
     fi
 
-    # Optional install block — enables zero-touch provisioning
-    local INSTALL_BLOCK=""
-    read -p "Enable auto-install (zero-touch, formats /dev/sda and reboots)? (y/n, default: n): " AUTO_INSTALL
-    if [ "${AUTO_INSTALL:-n}" = "y" ]; then
-        read -p "Install device (default: /dev/sda): " INSTALL_DEVICE
-        INSTALL_DEVICE=${INSTALL_DEVICE:-/dev/sda}
-        read -p "Config URL for remote config (optional, e.g. https://gist.../raw): " CONFIG_URL
-        INSTALL_BLOCK="install:
-  device: ${INSTALL_DEVICE}
+    # Determine hostname: per-node if IP provided, otherwise generic
+    local NODE_HOSTNAME
+    local OUTPUT_FILE
+    if [ -n "$NODE_IP" ]; then
+        local NODE_OCTET=$(echo "$NODE_IP" | cut -d. -f4)
+        NODE_HOSTNAME="${CLUSTER_NAME}-node-${NODE_OCTET}"
+        OUTPUT_FILE="worker-cloud-config-${NODE_OCTET}.yaml"
+    else
+        NODE_HOSTNAME="${CLUSTER_NAME}-node"
+        OUTPUT_FILE="$WORKER_CC_FILE"
+    fi
+
+    print_info "Generating worker cloud-config for ${NODE_HOSTNAME} → ${OUTPUT_FILE}..."
+
+    # Install block — auto-install with nousers:true REQUIRED for curl injection
+    local INSTALL_BLOCK="install:
+  device: auto
   auto: true
-  reboot: true
+  poweroff: true
+  nousers: true
   grub_options:
     extra_cmdline: \"rd.neednet=1\""
-        if [ -n "$CONFIG_URL" ]; then
-            INSTALL_BLOCK="${INSTALL_BLOCK}
-config_url: \"${CONFIG_URL}\""
-        fi
-    fi
 
     # Build SSH keys block (github key always, raw key as fallback if provided)
     local SSH_KEYS_BLOCK="      - github:${GITHUB_USER}"
@@ -423,12 +428,13 @@ config_url: \"${CONFIG_URL}\""
     # Base64-encode script for compact embedding
     local SCRIPT_B64=$(base64 -w0 "$0" 2>/dev/null || base64 "$0" | tr -d '\n')
 
-    cat > "$WORKER_CC_FILE" << EOF
+    cat > "$OUTPUT_FILE" << EOF
 #cloud-config
 # Worker node cloud-config for Kairos + k0s
+# Generated for: ${NODE_HOSTNAME}${NODE_IP:+ (}${NODE_IP}${NODE_IP:+)}
 # Reference: https://kairos.io/docs/reference/configuration/
 
-hostname: ${CLUSTER_NAME}-node
+hostname: ${NODE_HOSTNAME}
 
 users:
   - name: root
@@ -481,13 +487,6 @@ stages:
       commands:
         - curl -sL https://raw.githubusercontent.com/Kube-Link/k0s_script/master/kairos_k0s_cluster_manager.sh -o /root/kairos-cluster-manager.sh
         - chmod +x /root/kairos-cluster-manager.sh
-# Longhorn requirement + set hostname
-  initramfs:
-    - name: "Set hostname from IP (predictable name)"
-      commands:
-        - |
-          OCTET=\$(hostname -I | awk '{print \$1}' | cut -d. -f4)
-          hostnamectl set-hostname ${CLUSTER_NAME}-node-\${OCTET}
   boot.after:
     - name: "Enable iSCSI"
       commands:
@@ -513,21 +512,19 @@ EOF
 
     # Conditionally add qemu-guest-agent bundle for Proxmox
     if [ "${HYPERVISOR:-proxmox}" = "proxmox" ]; then
-        cat >> "$WORKER_CC_FILE" << 'BUNDLEEOF'
+        cat >> "$OUTPUT_FILE" << 'BUNDLEEOF'
 bundles:
   - targets:
       - run://quay.io/kairos/community-bundles:qemu-guest-agent_latest
 BUNDLEEOF
     fi
 
-    print_successful "Worker cloud-config written to $WORKER_CC_FILE"
-    print_info "Validate with: docker run -ti -v \"\$PWD\":/test --entrypoint /usr/bin/kairos-agent --rm quay.io/kairos/hadron:v0.4.0-core-amd64-generic-${KAIROS_IMAGE_VERSION} validate /test/${WORKER_CC_FILE}"
+    print_successful "Worker cloud-config written to ${OUTPUT_FILE}"
+    print_info "Validate with: docker run -ti -v \"\$PWD\":/test --entrypoint /usr/bin/kairos-agent --rm quay.io/kairos/hadron:v0.4.0-core-amd64-generic-${KAIROS_IMAGE_VERSION} validate /test/${OUTPUT_FILE}"
 }
 
-# -----------------------------------------------------------------------------
-# Worker token + cloud-config — runs on the first controller.
-# Reuses an existing .k0s_worker_token if present; otherwise generates a new one.
-# Always produces worker-cloud-config.yaml.
+# Produces one cloud-config per worker: worker-cloud-config-<octet>.yaml
+# If no WORKERS defined, produces a generic worker-cloud-config.yaml
 generate_worker_token() {
     print_info "Generating worker join token + cloud-config..."
 
@@ -553,13 +550,22 @@ generate_worker_token() {
         echo "$token" > .k0s_worker_token
     fi
 
-    generate_worker_cloudconfig "$token"
+    if [ ${#WORKERS[@]} -eq 0 ]; then
+        print_warning "No worker IPs defined in config — generating generic worker-cloud-config.yaml"
+        generate_worker_cloudconfig "$token" ""
+    else
+        for worker_ip in "${WORKERS[@]}"; do
+            generate_worker_cloudconfig "$token" "$worker_ip"
+        done
+        print_successful "All worker cloud-configs generated."
+        print_info "Files: $(ls worker-cloud-config-*.yaml 2>/dev/null | tr '\n' ' ')"
+    fi
 }
 
 # -----------------------------------------------------------------------------
 # Controller join token + cloud-config (HA) — runs on the first controller.
 # Reuses an existing .k0s_controller_token if present; otherwise generates a new one.
-# Always produces controller-join-cloud-config.yaml.
+# Produces one cloud-config per additional controller: controller-join-cloud-config-<octet>.yaml
 generate_controller_token() {
     print_info "Generating controller join token + cloud-config..."
 
@@ -585,38 +591,54 @@ generate_controller_token() {
         echo "$token" > .k0s_controller_token
     fi
 
-    generate_controller_join_cloudconfig "$token"
+    # Generate one config per additional controller IP
+    if [ ${#ADDITIONAL_CONTROLLERS[@]} -eq 0 ]; then
+        print_warning "No additional controller IPs defined in config — nothing to generate."
+        return 0
+    fi
+
+    for ctrl_ip in "${ADDITIONAL_CONTROLLERS[@]}"; do
+        generate_controller_join_cloudconfig "$token" "$ctrl_ip"
+    done
+
+    print_successful "All controller join cloud-configs generated."
+    print_info "Files: $(ls controller-join-cloud-config-*.yaml 2>/dev/null | tr '\n' ' ')"
 }
 
-# Generates a cloud-config for additional HA controllers that join the cluster.
-# Called automatically by generate_controller_token() (option 3).
+# Generates a cloud-config for one additional HA controller that joins the cluster.
+# Called by generate_controller_token() once per additional controller IP.
+# Parameters: $1 = join token, $2 = this node's IP address
 generate_controller_join_cloudconfig() {
-    print_info "Generating controller join cloud-config ($CONTROLLER_JOIN_CC_FILE)..."
-
     local CTRL_TOKEN="$1"
+    local NODE_IP="$2"
+
     if [ -z "$CTRL_TOKEN" ]; then
         print_error "No controller join token provided."
         return 1
     fi
+    if [ -z "$NODE_IP" ]; then
+        print_error "No node IP provided (second argument required)."
+        return 1
+    fi
 
-    # Optional install block — enables zero-touch provisioning
-    local INSTALL_BLOCK=""
-    read -p "Enable auto-install (zero-touch, formats /dev/sda and reboots)? (y/n, default: n): " AUTO_INSTALL
-    if [ "${AUTO_INSTALL:-n}" = "y" ]; then
-        read -p "Install device (default: /dev/sda): " INSTALL_DEVICE
-        INSTALL_DEVICE=${INSTALL_DEVICE:-/dev/sda}
-        read -p "Config URL for remote config (optional, e.g. https://gist.../raw): " CONFIG_URL
-        INSTALL_BLOCK="install:
-  device: ${INSTALL_DEVICE}
+    # Derive hostname from IP octet: hivemind-ctrl-2, hivemind-ctrl-3, etc.
+    local NODE_OCTET=$(echo "$NODE_IP" | cut -d. -f4)
+    local NODE_HOSTNAME="${CLUSTER_NAME}-ctrl-${NODE_OCTET}"
+
+    # Per-node output file: controller-join-cloud-config-2.yaml, etc.
+    local OUTPUT_FILE="controller-join-cloud-config-${NODE_OCTET}.yaml"
+
+    print_info "Generating controller join cloud-config for ${NODE_HOSTNAME} (${NODE_IP}) → ${OUTPUT_FILE}..."
+
+    # Install block — auto-install with nousers:true is REQUIRED for curl injection
+    # nousers:true bypasses the Kairos agent v3.3+ admin-group validation
+    local INSTALL_BLOCK="install:
+  device: auto
   auto: true
-  reboot: true
+  poweroff: true
+  nousers: true
   grub_options:
     extra_cmdline: \"rd.neednet=1\""
-        if [ -n "$CONFIG_URL" ]; then
-            INSTALL_BLOCK="${INSTALL_BLOCK}
-config_url: \"${CONFIG_URL}\""
-        fi
-    fi
 
     # Build SSH keys block
     local SSH_KEYS_BLOCK="      - github:${GITHUB_USER}"
@@ -630,13 +652,14 @@ config_url: \"${CONFIG_URL}\""
     # Base64-encode script for compact embedding
     local SCRIPT_B64=$(base64 -w0 "$0" 2>/dev/null || base64 "$0" | tr -d '\n')
 
-    cat > "$CONTROLLER_JOIN_CC_FILE" << EOF
+    cat > "$OUTPUT_FILE" << EOF
 #cloud-config
 # Additional controller node cloud-config for Kairos + k0s (HA join)
+# Generated for: ${NODE_HOSTNAME} (${NODE_IP})
 # The provider detects /etc/k0s/token and joins instead of init.
 # Reference: https://kairos.io/docs/reference/configuration/
 
-hostname: ${CLUSTER_NAME}-ctrl
+hostname: ${NODE_HOSTNAME}
 
 users:
   - name: root
@@ -664,12 +687,12 @@ write_files:
         name: ${CLUSTER_NAME}
       spec:
         api:
-          address: NODE_ADDRESS_PLACEHOLDER
-          externalAddress: NODE_ADDRESS_PLACEHOLDER
+          address: ${NODE_IP}
+          externalAddress: ${NODE_IP}
           port: 6443
           sans:
             - ${CONTROLLER_IP}
-            - NODE_ADDRESS_PLACEHOLDER
+            - ${NODE_IP}
         network:
           provider: custom
           podCIDR: ${POD_CIDR}
@@ -679,7 +702,7 @@ write_files:
         storage:
           type: etcd
           etcd:
-            peerAddress: PEER_ADDRESS_PLACEHOLDER
+            peerAddress: ${NODE_IP}
         controllerManager: {}
         scheduler: {}
         telemetry:
@@ -718,17 +741,6 @@ stages:
       commands:
         - curl -sL https://raw.githubusercontent.com/Kube-Link/k0s_script/master/kairos_k0s_cluster_manager.sh -o /root/kairos-cluster-manager.sh
         - chmod +x /root/kairos-cluster-manager.sh
-# Set hostname and etcd peerAddress from this node's IP (not known until boot)
-  initramfs:
-    - name: "Set hostname and etcd peer address from IP"
-      commands:
-        - |
-          IP=\$(hostname -I | awk '{print \$1}')
-          OCTET=\$(echo \$IP | cut -d. -f4)
-          hostnamectl set-hostname ${CLUSTER_NAME}-ctrl-\${OCTET}
-          if [ -n "\$IP" ]; then
-            sed -i "s/PEER_ADDRESS_PLACEHOLDER/\$IP/g; s/NODE_ADDRESS_PLACEHOLDER/\$IP/g" ${K0S_CONFIG_PATH}
-          fi
   boot.after:
     - name: "Enable iSCSI"
       commands:
@@ -751,16 +763,16 @@ upgrade:
 EOF
 
     if [ "${HYPERVISOR:-proxmox}" = "proxmox" ]; then
-        cat >> "$CONTROLLER_JOIN_CC_FILE" << 'BUNDLEEOF'
+        cat >> "$OUTPUT_FILE" << 'BUNDLEEOF'
 bundles:
   - targets:
       - run://quay.io/kairos/community-bundles:qemu-guest-agent_latest
 BUNDLEEOF
     fi
 
-    print_successful "Controller join cloud-config written to $CONTROLLER_JOIN_CC_FILE"
-    print_info "Boot additional controllers with this config. They auto-join the HA control plane."
-    print_info "Validate with: docker run -ti -v \"\$PWD\":/test --entrypoint /usr/bin/kairos-agent --rm quay.io/kairos/hadron:v0.4.0-core-amd64-generic-${KAIROS_IMAGE_VERSION} validate /test/${CONTROLLER_JOIN_CC_FILE}"
+    print_successful "Controller join cloud-config written to ${OUTPUT_FILE}"
+    print_info "Inject to ${NODE_IP}: curl -X POST -F 'cloud-config=@${OUTPUT_FILE}' http://${NODE_IP}:8080/install"
+    print_info "Validate with: docker run -ti -v \"\$PWD\":/test --entrypoint /usr/bin/kairos-agent --rm quay.io/kairos/hadron:v0.4.0-core-amd64-generic-${KAIROS_IMAGE_VERSION} validate /test/${OUTPUT_FILE}"
 }
 
 # -----------------------------------------------------------------------------
@@ -802,7 +814,7 @@ install_cilium_cli() {
         CLI_ARCH=amd64
         curl -L --fail --remote-name-all \
             "https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-${CLI_ARCH}.tar.gz"
-        sudo tar xzvfC "cilium-linux-${CLI_ARCH}.tar.gz" /usr/local/bin
+        sudo tar xzvf "cilium-linux-${CLI_ARCH}.tar.gz" -C /usr/local/bin
         rm "cilium-linux-${CLI_ARCH}.tar.gz"
         print_successful "Cilium CLI installed"
     else
@@ -921,6 +933,193 @@ check_cluster_status() {
     else
         print_error "k0s not found on this node."
     fi
+}
+
+# -----------------------------------------------------------------------------
+# Cilium version / upgrade checks (ported from k3s script)
+# -----------------------------------------------------------------------------
+check_cilium_version() {
+    print_info "Checking current Cilium version..."
+
+    if command -v cilium &>/dev/null; then
+        local cli_version=$(cilium version 2>/dev/null | grep "cilium-cli" | awk '{print $2}')
+        print_successful "Cilium CLI Version: $cli_version"
+
+        # Check Cilium version in the cluster
+        export KUBECONFIG="${K0S_KUBECONFIG}"
+        if kubectl get pods -n kube-system -l k8s-app=cilium &>/dev/null; then
+            local cilium_version=""
+
+            # Try cilium version command
+            cilium_version=$(cilium version 2>/dev/null | grep -E "cilium-daemon|daemon" | head -n1 | awk '{print $2}' | tr -d 'v')
+
+            # Fallback: kubectl from DaemonSet
+            if [ -z "$cilium_version" ] || [ "$cilium_version" = "unknown" ]; then
+                cilium_version=$(kubectl get daemonset cilium -n kube-system -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | cut -d':' -f2)
+            fi
+
+            if [ -n "$cilium_version" ] && [ "$cilium_version" != "unknown" ]; then
+                [[ ! "$cilium_version" =~ ^v ]] && cilium_version="v$cilium_version"
+                print_successful "Cilium Version (in cluster): $cilium_version"
+            else
+                print_warning "Cilium Version (in cluster): Unable to determine"
+                cilium_version=""
+            fi
+
+            # Check latest stable
+            print_info "Checking latest stable Cilium version..."
+            local latest_version
+            latest_version=$(curl -s https://raw.githubusercontent.com/cilium/cilium/master/stable.txt 2>/dev/null)
+            [ -z "$latest_version" ] && latest_version=$(curl -s https://api.github.com/repos/cilium/cilium/releases/latest 2>/dev/null | grep -oP '"tag_name":\s*"\K[^"]+')
+            print_successful "Latest Stable Cilium Version: $latest_version"
+
+            if [ -n "$cilium_version" ] && [ "$cilium_version" = "$latest_version" ]; then
+                print_successful "You are running the latest stable version."
+            elif [ -n "$cilium_version" ]; then
+                print_info "An upgrade is available from $cilium_version to $latest_version"
+            fi
+        else
+            print_info "Cilium CLI is installed, but Cilium is not detected in the cluster."
+            local latest_version
+            latest_version=$(curl -s https://raw.githubusercontent.com/cilium/cilium/master/stable.txt 2>/dev/null)
+            [ -z "$latest_version" ] && latest_version=$(curl -s https://api.github.com/repos/cilium/cilium/releases/latest 2>/dev/null | grep -oP '"tag_name":\s*"\K[^"]+')
+            print_successful "Latest Stable Cilium Version: $latest_version"
+        fi
+    else
+        print_error "Cilium CLI is not installed or not in PATH."
+        local latest_version
+        latest_version=$(curl -s https://raw.githubusercontent.com/cilium/cilium/master/stable.txt 2>/dev/null)
+        [ -z "$latest_version" ] && latest_version=$(curl -s https://api.github.com/repos/cilium/cilium/releases/latest 2>/dev/null | grep -oP '"tag_name":\s*"\K[^"]+')
+        print_successful "Latest Stable Cilium Version: $latest_version"
+    fi
+}
+
+check_fluxcd_version() {
+    print_info "Checking FluxCD version..."
+
+    if command -v flux &>/dev/null; then
+        local cli_version=$(flux --version 2>/dev/null | head -1)
+        print_successful "Flux CLI Version: $cli_version"
+    else
+        print_info "Flux CLI not installed locally."
+    fi
+
+    # Check cluster-side Flux version
+    export KUBECONFIG="${K0S_KUBECONFIG}"
+    if kubectl get namespace flux-system &>/dev/null; then
+        local cluster_version
+        cluster_version=$(kubectl get deployment -n flux-system source-controller -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | cut -d':' -f2)
+        if [ -n "$cluster_version" ]; then
+            print_successful "FluxCD Version (in cluster): $cluster_version"
+        fi
+
+        local latest_version
+        latest_version=$(curl -s https://api.github.com/repos/fluxcd/flux2/releases/latest 2>/dev/null | grep -oP '"tag_name":\s*"\K[^"]+')
+        [ -n "$latest_version" ] && print_info "Latest FluxCD Version: $latest_version"
+    else
+        print_info "FluxCD not detected in cluster."
+    fi
+}
+
+list_available_versions() {
+    echo -e "${YELLOW}======== Available Versions ========${NC}"
+
+    # k0s versions
+    print_info "Latest k0s Releases (Last 5):"
+    curl -s https://api.github.com/repos/k0sproject/k0s/releases 2>/dev/null | \
+        grep -oP '"tag_name":\s*"\K[^"]+' | head -n 5 | \
+        while read -r version; do echo "   $version"; done
+    echo ""
+
+    # Cilium versions
+    print_info "Cilium Stable Version:"
+    curl -s https://raw.githubusercontent.com/cilium/cilium/master/stable.txt 2>/dev/null | xargs -I{} echo "   {}"
+    echo ""
+    print_info "Latest Cilium Releases (Last 5):"
+    curl -s https://api.github.com/repos/cilium/cilium/releases 2>/dev/null | \
+        grep -oP '"tag_name":\s*"\K[^"]+' | head -n 5 | \
+        while read -r version; do echo "   $version"; done
+    echo ""
+
+    # FluxCD versions
+    print_info "Latest FluxCD Releases (Last 5):"
+    curl -s https://api.github.com/repos/fluxcd/flux2/releases 2>/dev/null | \
+        grep -oP '"tag_name":\s*"\K[^"]+' | head -n 5 | \
+        while read -r version; do echo "   $version"; done
+    echo ""
+
+    # Kairos versions
+    print_info "Latest Kairos Releases (Last 5):"
+    curl -s https://api.github.com/repos/kairos-io/kairos/releases 2>/dev/null | \
+        grep -oP '"tag_name":\s*"\K[^"]+' | head -n 5 | \
+        while read -r version; do echo "   $version"; done
+
+    echo -e "${YELLOW}===================================${NC}"
+}
+
+check_versions() {
+    echo -e "${YELLOW}======== Version Check ========${NC}"
+    echo "1. Check k0s Version"
+    echo "2. Check Kairos Version"
+    echo "3. Check Cilium Version"
+    echo "4. Check FluxCD Version"
+    echo "5. Check Script Version"
+    echo "6. List Available Versions"
+    echo "7. Check All Versions"
+    echo "8. Back to Main Menu"
+    read -p "Enter your choice: " check_choice
+
+    case $check_choice in
+        1) check_k0s_version ;;
+        2) check_kairos_version ;;
+        3) check_cilium_version ;;
+        4) check_fluxcd_version ;;
+        5) check_script_version ;;
+        6) list_available_versions ;;
+        7)
+            check_k0s_version; echo ""
+            check_kairos_version; echo ""
+            check_cilium_version; echo ""
+            check_fluxcd_version; echo ""
+            check_script_version; echo ""
+            read -p "Would you like to see all available versions? (y/n): " list_choice
+            [ "$list_choice" = "y" ] && list_available_versions
+            ;;
+        8) return ;;
+        *) print_error "Invalid option. Returning to main menu." ;;
+    esac
+}
+
+upgrade_cilium() {
+    print_info "Upgrading Cilium..."
+
+    if ! command -v cilium &>/dev/null; then
+        print_info "Cilium CLI not found. Installing it first..."
+        install_cilium_cli
+    else
+        print_info "Upgrading Cilium CLI to the latest version..."
+        local CILIUM_CLI_VERSION
+        CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
+        local CLI_ARCH=amd64
+        curl -L --fail --remote-name-all \
+            "https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-${CLI_ARCH}.tar.gz"
+        sudo tar xzvf "cilium-linux-${CLI_ARCH}.tar.gz" -C /usr/local/bin
+        rm "cilium-linux-${CLI_ARCH}.tar.gz"
+        print_successful "Cilium CLI upgraded to $CILIUM_CLI_VERSION"
+    fi
+
+    read -p "Enter specific Cilium version to upgrade to (leave empty for latest): " CILIUM_VERSION
+
+    local VERSION_FLAG=""
+    [ -n "$CILIUM_VERSION" ] && VERSION_FLAG="--version $CILIUM_VERSION"
+
+    print_info "Upgrading Cilium in cluster..."
+    export KUBECONFIG="${K0S_KUBECONFIG}"
+    cilium upgrade $VERSION_FLAG
+
+    print_info "Waiting for Cilium to be ready..."
+    cilium status --wait
+    print_successful "Cilium upgrade completed."
 }
 
 # -----------------------------------------------------------------------------
@@ -1476,6 +1675,24 @@ bootstrap_fluxcd() {
     print_successful "FluxCD bootstrap process completed."
 }
 
+manage_cilium() {
+    echo -e "${YELLOW}======== Cilium Management ========${NC}"
+    echo "1. Install Cilium"
+    echo "2. Upgrade Cilium"
+    echo "3. Check Cilium Version"
+    echo "4. Back to Main Menu"
+    echo -e "${YELLOW}==================================${NC}"
+    read -p "Enter your choice: " cilium_choice
+
+    case $cilium_choice in
+        1) ensure_config && install_cilium ;;
+        2) upgrade_cilium ;;
+        3) check_cilium_version ;;
+        4) return ;;
+        *) print_error "Invalid option. Returning to main menu." ;;
+    esac
+}
+
 manage_flux() {
     echo -e "${YELLOW}======== FluxCD Management ========${NC}"
     echo "1. Bootstrap FluxCD with GitHub"
@@ -1601,10 +1818,10 @@ while true; do
     echo "3.  Generate Controller Join Token + Cloud-Config (HA)"
     echo "4.  Generate Worker Token + Cloud-Config"
     echo "5.  Generate Kairos Dockerfile (image build)"
-    echo "6.  Install Cilium"
+    echo "6.  Manage Cilium (install / upgrade / status)"
     echo "7.  Manage FluxCD"
     echo "8.  Manage BGP Configuration"
-    echo "9.  Check Versions (k0s / Kairos)"
+    echo "9.  Check Versions"
     echo "10. Check Cluster Status"
     echo "11. Reset Node"
     echo "12. Rolling OS Upgrade (A/B)"
@@ -1620,10 +1837,10 @@ while true; do
         3) ensure_config && generate_controller_token ;;
         4) ensure_config && generate_worker_token ;;
         5) ensure_config && generate_kairos_dockerfile ;;
-        6) ensure_config && install_cilium ;;
+        6) manage_cilium ;;
         7) manage_flux ;;
         8) manage_bgp ;;
-        9) check_script_version; check_k0s_version; check_kairos_version ;;
+        9) check_versions ;;
         10) check_cluster_status ;;
         11) reset_node ;;
         12) kairos_rolling_upgrade ;;
