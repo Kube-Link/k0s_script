@@ -45,12 +45,13 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.19"
+SCRIPT_VERSION="1.0.22"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
 DEFAULT_SERVICE_CIDR="10.96.0.0/12"
 DEFAULT_CLUSTER_NAME="homelab"
+WORKER_INSTALL_STATE_FILE=".kairos_worker_installs_submitted"
 
 build_controller_k0s_args() {
     local include_token="${1:-false}"
@@ -138,7 +139,7 @@ generate_config_file() {
     SERVICE_CIDR=${SERVICE_CIDR:-$DEFAULT_SERVICE_CIDR}
     echo "SERVICE_CIDR=$SERVICE_CIDR" >> "$CONFIG_FILE"
 
-    read -p "Install Cilium after k0s is up (y/n)? " INSTALL_CILIUM
+    read -p "Auto-install Cilium after all workers are installed and registered (y/n)? " INSTALL_CILIUM
     echo "INSTALL_CILIUM=$INSTALL_CILIUM" >> "$CONFIG_FILE"
 
     read -p "GitHub username for SSH key injection: " GITHUB_USER
@@ -282,8 +283,7 @@ config_url: \"${CONFIG_URL}\""
     local USER_PASSWD=$(hash_password "kairos")
     print_info "Password hash: ${USER_PASSWD:0:20}..."
 
-    # Compute hostname from controller IP (known at generation time)
-    local CTRL_HOSTNAME="${CLUSTER_NAME}-ctrl-$(echo ${CONTROLLER_IP} | cut -d. -f4)"
+    local CTRL_HOSTNAME="${CLUSTER_NAME}-ctrl-1"
 
     local K0S_ARGS
     K0S_ARGS=$(build_controller_k0s_args false)
@@ -408,30 +408,34 @@ BUNDLEEOF
     fi
 
     print_successful "Controller cloud-config written to $CONTROLLER_CC_FILE"
-    print_info "Next: boot the Kairos ISO on the controller, supply this file at install time."
+    print_info "Next: use main menu option 5 -> 1 to send this config to the primary controller installer."
     print_info "Validate with: docker run -ti -v \"\$PWD\":/test --entrypoint /usr/bin/kairos-agent --rm quay.io/kairos/hadron:v0.4.0-core-amd64-generic-${KAIROS_IMAGE_VERSION} validate /test/${CONTROLLER_CC_FILE}"
 }
 
 # Generates the worker cloud-config. Requires a token from the controller.
-# Parameters: $1 = worker token, $2 = worker node IP (optional, for per-node hostname)
+# Parameters: $1 = worker token, $2 = worker node IP (optional), $3 = worker index (optional)
 generate_worker_cloudconfig() {
     local WORKER_TOKEN="$1"
     local NODE_IP="$2"
+    local NODE_INDEX="$3"
 
     if [ -z "$WORKER_TOKEN" ]; then
         print_error "No worker token provided."
         return 1
     fi
 
-    # Determine hostname: per-node if IP provided, otherwise generic
     local NODE_HOSTNAME
     local OUTPUT_FILE
     if [ -n "$NODE_IP" ]; then
-        local NODE_OCTET=$(echo "$NODE_IP" | cut -d. -f4)
-        NODE_HOSTNAME="${CLUSTER_NAME}-node-${NODE_OCTET}"
-        OUTPUT_FILE="worker-cloud-config-${NODE_OCTET}.yaml"
+        NODE_INDEX=${NODE_INDEX:-$(worker_index_for_ip "$NODE_IP")}
+        if [ -z "$NODE_INDEX" ]; then
+            print_error "Could not determine worker index for IP: ${NODE_IP}"
+            return 1
+        fi
+        NODE_HOSTNAME="${CLUSTER_NAME}-wrkr-${NODE_INDEX}"
+        OUTPUT_FILE="worker-cloud-config-${NODE_INDEX}.yaml"
     else
-        NODE_HOSTNAME="${CLUSTER_NAME}-node"
+        NODE_HOSTNAME="${CLUSTER_NAME}-wrkr"
         OUTPUT_FILE="$WORKER_CC_FILE"
     fi
 
@@ -552,7 +556,7 @@ BUNDLEEOF
     print_info "Validate with: docker run -ti -v \"\$PWD\":/test --entrypoint /usr/bin/kairos-agent --rm quay.io/kairos/hadron:v0.4.0-core-amd64-generic-${KAIROS_IMAGE_VERSION} validate /test/${OUTPUT_FILE}"
 }
 
-# Produces one cloud-config per worker: worker-cloud-config-<octet>.yaml
+# Produces one cloud-config per worker: worker-cloud-config-<index>.yaml
 # If no WORKERS defined, produces a generic worker-cloud-config.yaml
 generate_worker_token() {
     print_info "Generating worker join token + cloud-config..."
@@ -582,19 +586,24 @@ generate_worker_token() {
     if [ ${#WORKERS[@]} -eq 0 ]; then
         print_warning "No worker IPs defined in config — generating generic worker-cloud-config.yaml"
         generate_worker_cloudconfig "$token" ""
+        print_info "Next: use main menu option 5 -> 6 to send this generic worker config to a custom installer target."
     else
-        for worker_ip in "${WORKERS[@]}"; do
-            generate_worker_cloudconfig "$token" "$worker_ip"
+        local generated_files=()
+        local i
+        for i in "${!WORKERS[@]}"; do
+            generate_worker_cloudconfig "$token" "${WORKERS[$i]}" "$((i + 1))"
+            generated_files+=("worker-cloud-config-$((i + 1)).yaml")
         done
         print_successful "All worker cloud-configs generated."
-        print_info "Files: $(ls worker-cloud-config-*.yaml 2>/dev/null | tr '\n' ' ')"
+        print_info "Files: ${generated_files[*]}"
+        print_info "Next: use main menu option 5 -> 4 for one worker, or option 5 -> 5 for all workers."
     fi
 }
 
 # -----------------------------------------------------------------------------
 # Controller join token + cloud-config (HA) — runs on the first controller.
 # Reuses an existing .k0s_controller_token if present; otherwise generates a new one.
-# Produces one cloud-config per additional controller: controller-join-cloud-config-<octet>.yaml
+# Produces one cloud-config per additional controller: controller-join-cloud-config-<index>.yaml
 generate_controller_token() {
     print_info "Generating controller join token + cloud-config..."
 
@@ -626,20 +635,25 @@ generate_controller_token() {
         return 0
     fi
 
-    for ctrl_ip in "${ADDITIONAL_CONTROLLERS[@]}"; do
-        generate_controller_join_cloudconfig "$token" "$ctrl_ip"
+    local i
+    local generated_files=()
+    for i in "${!ADDITIONAL_CONTROLLERS[@]}"; do
+        generate_controller_join_cloudconfig "$token" "${ADDITIONAL_CONTROLLERS[$i]}" "$((i + 2))"
+        generated_files+=("controller-join-cloud-config-$((i + 2)).yaml")
     done
 
     print_successful "All controller join cloud-configs generated."
-    print_info "Files: $(ls controller-join-cloud-config-*.yaml 2>/dev/null | tr '\n' ' ')"
+    print_info "Files: ${generated_files[*]}"
+    print_info "Next: use main menu option 5 -> 2 for one additional controller, or option 5 -> 3 for all additional controllers."
 }
 
 # Generates a cloud-config for one additional HA controller that joins the cluster.
 # Called by generate_controller_token() once per additional controller IP.
-# Parameters: $1 = join token, $2 = this node's IP address
+# Parameters: $1 = join token, $2 = this node's IP address, $3 = controller index
 generate_controller_join_cloudconfig() {
     local CTRL_TOKEN="$1"
     local NODE_IP="$2"
+    local NODE_INDEX="$3"
 
     if [ -z "$CTRL_TOKEN" ]; then
         print_error "No controller join token provided."
@@ -650,12 +664,15 @@ generate_controller_join_cloudconfig() {
         return 1
     fi
 
-    # Derive hostname from IP octet: hivemind-ctrl-2, hivemind-ctrl-3, etc.
-    local NODE_OCTET=$(echo "$NODE_IP" | cut -d. -f4)
-    local NODE_HOSTNAME="${CLUSTER_NAME}-ctrl-${NODE_OCTET}"
+    NODE_INDEX=${NODE_INDEX:-$(controller_index_for_ip "$NODE_IP")}
+    if [ -z "$NODE_INDEX" ]; then
+        print_error "Could not determine controller index for IP: ${NODE_IP}"
+        return 1
+    fi
 
-    # Per-node output file: controller-join-cloud-config-2.yaml, etc.
-    local OUTPUT_FILE="controller-join-cloud-config-${NODE_OCTET}.yaml"
+    local NODE_HOSTNAME="${CLUSTER_NAME}-ctrl-${NODE_INDEX}"
+
+    local OUTPUT_FILE="controller-join-cloud-config-${NODE_INDEX}.yaml"
 
     local K0S_ARGS
     K0S_ARGS=$(build_controller_k0s_args true)
@@ -801,7 +818,7 @@ BUNDLEEOF
     fi
 
     print_successful "Controller join cloud-config written to ${OUTPUT_FILE}"
-    print_info "Inject to ${NODE_IP}: curl -X POST -F 'cloud-config=@${OUTPUT_FILE}' http://${NODE_IP}:8080/install"
+    print_info "Installer target: http://${NODE_IP}:8080"
     print_info "Validate with: docker run -ti -v \"\$PWD\":/test --entrypoint /usr/bin/kairos-agent --rm quay.io/kairos/hadron:v0.4.0-core-amd64-generic-${KAIROS_IMAGE_VERSION} validate /test/${OUTPUT_FILE}"
 }
 
@@ -821,16 +838,64 @@ normalize_installer_url() {
 
 controller_join_cloudconfig_file_for_ip() {
     local node_ip="$1"
-    local node_octet
-    node_octet=$(echo "$node_ip" | cut -d. -f4)
-    echo "controller-join-cloud-config-${node_octet}.yaml"
+    local node_index
+    node_index=$(controller_index_for_ip "$node_ip")
+    if [ -n "$node_index" ]; then
+        echo "controller-join-cloud-config-${node_index}.yaml"
+    else
+        echo "controller-join-cloud-config-unknown.yaml"
+    fi
 }
 
 worker_cloudconfig_file_for_ip() {
     local node_ip="$1"
-    local node_octet
-    node_octet=$(echo "$node_ip" | cut -d. -f4)
-    echo "worker-cloud-config-${node_octet}.yaml"
+    local node_index
+    node_index=$(worker_index_for_ip "$node_ip")
+    if [ -n "$node_index" ]; then
+        echo "worker-cloud-config-${node_index}.yaml"
+    else
+        echo "worker-cloud-config-unknown.yaml"
+    fi
+}
+
+controller_index_for_ip() {
+    local node_ip="$1"
+    local i
+
+    if [ "$node_ip" = "$CONTROLLER_IP" ]; then
+        echo 1
+        return 0
+    fi
+
+    for i in "${!ADDITIONAL_CONTROLLERS[@]}"; do
+        if [ "$node_ip" = "${ADDITIONAL_CONTROLLERS[$i]}" ]; then
+            echo "$((i + 2))"
+            return 0
+        fi
+    done
+}
+
+worker_index_for_ip() {
+    local node_ip="$1"
+    local i
+
+    for i in "${!WORKERS[@]}"; do
+        if [ "$node_ip" = "${WORKERS[$i]}" ]; then
+            echo "$((i + 1))"
+            return 0
+        fi
+    done
+}
+
+worker_hostname_for_ip() {
+    local node_ip="$1"
+    local node_index
+    node_index=$(worker_index_for_ip "$node_ip")
+    if [ -n "$node_index" ]; then
+        echo "${CLUSTER_NAME}-wrkr-${node_index}"
+    else
+        echo ""
+    fi
 }
 
 join_by_comma() {
@@ -844,6 +909,145 @@ join_by_comma() {
         fi
     done
     echo "$result"
+}
+
+mark_worker_install_submitted() {
+    local worker_ip="$1"
+    [ -z "$worker_ip" ] && return 0
+
+    touch "$WORKER_INSTALL_STATE_FILE"
+    if ! grep -qx "$worker_ip" "$WORKER_INSTALL_STATE_FILE" 2>/dev/null; then
+        echo "$worker_ip" >> "$WORKER_INSTALL_STATE_FILE"
+    fi
+}
+
+count_submitted_worker_installs() {
+    local count=0
+    local worker_ip
+
+    if [ ! -f "$WORKER_INSTALL_STATE_FILE" ]; then
+        echo 0
+        return 0
+    fi
+
+    for worker_ip in "${WORKERS[@]}"; do
+        if grep -qx "$worker_ip" "$WORKER_INSTALL_STATE_FILE" 2>/dev/null; then
+            count=$((count + 1))
+        fi
+    done
+
+    echo "$count"
+}
+
+all_worker_installs_submitted() {
+    [ ${#WORKERS[@]} -gt 0 ] || return 1
+    [ "$(count_submitted_worker_installs)" -eq "${#WORKERS[@]}" ]
+}
+
+cilium_requested() {
+    case "${INSTALL_CILIUM:-n}" in
+        y|Y|yes|YES|true|TRUE) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+cilium_already_installed() {
+    command -v k0s &>/dev/null || return 1
+    k0s kubectl get daemonset cilium -n kube-system &>/dev/null
+}
+
+all_configured_workers_registered() {
+    command -v k0s &>/dev/null || return 1
+
+    local worker_ip worker_name
+    for worker_ip in "${WORKERS[@]}"; do
+        worker_name=$(worker_hostname_for_ip "$worker_ip")
+        if ! k0s kubectl get node "$worker_name" &>/dev/null; then
+            return 1
+        fi
+    done
+
+    return 0
+}
+
+print_worker_registration_status() {
+    command -v k0s &>/dev/null || return 1
+
+    local worker_ip worker_name status
+    for worker_ip in "${WORKERS[@]}"; do
+        worker_name=$(worker_hostname_for_ip "$worker_ip")
+        status=$(k0s kubectl get node "$worker_name" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+        if [ -n "$status" ]; then
+            echo "  ${worker_name} (${worker_ip}): registered, Ready=${status}"
+        else
+            echo "  ${worker_name} (${worker_ip}): not registered yet"
+        fi
+    done
+}
+
+wait_for_configured_workers_registered() {
+    local timeout_seconds="${1:-1800}"
+    local deadline=$((SECONDS + timeout_seconds))
+
+    if ! command -v k0s &>/dev/null; then
+        print_warning "k0s not found on this machine. Auto Cilium install must run from a controller."
+        return 1
+    fi
+
+    print_info "Waiting for all configured workers to register with k0s..."
+    print_info "Workers can be NotReady here; Cilium is what makes them Ready."
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        print_worker_registration_status
+        if all_configured_workers_registered; then
+            print_successful "All configured workers are registered."
+            return 0
+        fi
+        sleep 15
+    done
+
+    print_warning "Timed out waiting for workers to register."
+    print_info "If the installers powered off after install, start the worker VMs and run Manage Cilium -> Install Cilium later."
+    return 1
+}
+
+maybe_auto_install_cilium_after_worker_install() {
+    cilium_requested || return 0
+
+    if [ ${#WORKERS[@]} -eq 0 ]; then
+        print_info "INSTALL_CILIUM=y, but no separate workers are configured."
+        return 0
+    fi
+
+    if cilium_already_installed; then
+        print_successful "Cilium is already installed."
+        return 0
+    fi
+
+    local submitted_count
+    submitted_count=$(count_submitted_worker_installs)
+    if ! all_worker_installs_submitted; then
+        print_info "INSTALL_CILIUM=y. Waiting until all worker installs are submitted before deploying Cilium (${submitted_count}/${#WORKERS[@]} submitted)."
+        return 0
+    fi
+
+    print_successful "All configured worker install requests have been submitted (${submitted_count}/${#WORKERS[@]})."
+    print_warning "Cilium will install only after the workers reboot and appear as k0s nodes."
+    read -p "Wait for workers and install Cilium now? (y/n, default: y): " install_now
+    install_now=${install_now:-y}
+    if [ "$install_now" != "y" ]; then
+        print_info "Auto install skipped. Later run Manage Cilium -> Install Cilium."
+        return 0
+    fi
+
+    wait_for_configured_workers_registered 1800 || return 1
+
+    if cilium_already_installed; then
+        print_successful "Cilium is already installed."
+        return 0
+    fi
+
+    print_info "Installing Cilium now..."
+    install_cilium
 }
 
 inject_cloudconfig_webinstaller() {
@@ -941,7 +1145,7 @@ inject_cloudconfig_webinstaller() {
     read -p "Type INSTALL to submit and start installation: " confirm_install
     if [ "$confirm_install" != "INSTALL" ]; then
         print_warning "Install cancelled."
-        return 0
+        return 2
     fi
 
     local curl_args=(-X POST -F "cloud-config=<${cloud_config_file}" -F "installation-device=${install_device}")
@@ -1028,7 +1232,10 @@ inject_one_worker() {
         return 1
     fi
 
-    inject_cloudconfig_webinstaller "$(worker_cloudconfig_file_for_ip "$worker_ip")" "$worker_ip"
+    if inject_cloudconfig_webinstaller "$(worker_cloudconfig_file_for_ip "$worker_ip")" "$worker_ip"; then
+        mark_worker_install_submitted "$worker_ip"
+        maybe_auto_install_cilium_after_worker_install
+    fi
 }
 
 inject_all_workers() {
@@ -1039,8 +1246,14 @@ inject_all_workers() {
 
     local worker_ip
     for worker_ip in "${WORKERS[@]}"; do
-        inject_cloudconfig_webinstaller "$(worker_cloudconfig_file_for_ip "$worker_ip")" "$worker_ip" || return 1
+        if inject_cloudconfig_webinstaller "$(worker_cloudconfig_file_for_ip "$worker_ip")" "$worker_ip"; then
+            mark_worker_install_submitted "$worker_ip"
+        else
+            return 1
+        fi
     done
+
+    maybe_auto_install_cilium_after_worker_install
 }
 
 manage_web_installer() {
