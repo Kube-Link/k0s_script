@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.15"
+SCRIPT_VERSION="1.0.17"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -64,6 +64,23 @@ build_controller_k0s_args() {
         printf '    - --enable-worker\n'
         printf '    - --no-taints\n'
     fi
+}
+
+print_github_ssh_key_guide() {
+    local github_user="$1"
+    local public_key="$2"
+
+    print_info "GitHub SSH key setup for Kairos:"
+    echo "  1. Open: https://github.com/settings/keys"
+    echo "  2. Click: New SSH key"
+    echo "  3. Title: kairos-cluster-key (or your cluster name)"
+    echo "  4. Key type: Authentication Key"
+    echo "  5. Paste this public key and click Add SSH key:"
+    echo -e "     ${GREEN}${public_key}${NC}"
+    echo "  6. Optional local test, from a machine with the private key:"
+    echo "     ssh -T git@github.com"
+    echo ""
+    print_info "The cloud-config uses github:${github_user}; the raw key is embedded as a fallback too."
 }
 
 # -----------------------------------------------------------------------------
@@ -172,9 +189,7 @@ generate_config_file() {
     # Remind user to upload to GitHub so the native github: mechanism works too
     if [ -n "$SSH_PUBKEY" ] && [ -n "$GITHUB_USER" ]; then
         echo ""
-        print_info "For the native Kairos github:$GITHUB_USER key injection to work,"
-        print_info "upload this public key to: https://github.com/settings/keys"
-        echo -e "  ${GREEN}$SSH_PUBKEY${NC}"
+        print_github_ssh_key_guide "$GITHUB_USER" "$SSH_PUBKEY"
         echo ""
         read -p "Press Enter to continue..."
     fi
@@ -818,6 +833,19 @@ worker_cloudconfig_file_for_ip() {
     echo "worker-cloud-config-${node_octet}.yaml"
 }
 
+join_by_comma() {
+    local result=""
+    local item
+    for item in "$@"; do
+        if [ -z "$result" ]; then
+            result="$item"
+        else
+            result="${result}, ${item}"
+        fi
+    done
+    echo "$result"
+}
+
 inject_cloudconfig_webinstaller() {
     local preset_file="$1"
     local preset_target="$2"
@@ -1017,12 +1045,21 @@ inject_all_workers() {
 
 manage_web_installer() {
     while true; do
+        local additional_controller_label="none configured"
+        local worker_label="none configured"
+        if [ ${#ADDITIONAL_CONTROLLERS[@]} -gt 0 ]; then
+            additional_controller_label=$(join_by_comma "${ADDITIONAL_CONTROLLERS[@]}")
+        fi
+        if [ ${#WORKERS[@]} -gt 0 ]; then
+            worker_label=$(join_by_comma "${WORKERS[@]}")
+        fi
+
         echo -e "\n${YELLOW}======== Kairos Web Installer ========${NC}"
         echo "1. Install primary controller (${CONTROLLER_IP})"
-        echo "2. Install one additional controller"
-        echo "3. Install all additional controllers"
-        echo "4. Install one worker"
-        echo "5. Install all workers"
+        echo "2. Install one additional controller (${additional_controller_label})"
+        echo "3. Install all additional controllers (${additional_controller_label})"
+        echo "4. Install one worker (${worker_label})"
+        echo "5. Install all workers (${worker_label})"
         echo "6. Custom YAML / installer target"
         echo "7. Back"
         echo -e "${YELLOW}======================================${NC}"
