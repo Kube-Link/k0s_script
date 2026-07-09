@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.13"
+SCRIPT_VERSION="1.0.15"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -1214,9 +1214,20 @@ check_cluster_status() {
     fi
     echo ""
 
-    print_info "Registered Kubernetes nodes:"
+    print_info "k0s kubectl get node:"
+    local nodes_compact_output
+    nodes_compact_output=$(k0s kubectl get node 2>&1)
+    if [ $? -eq 0 ]; then
+        echo "$nodes_compact_output"
+    else
+        print_warning "Could not list nodes:"
+        echo "$nodes_compact_output"
+    fi
+    echo ""
+
+    print_info "k0s kubectl get node -o wide:"
     local nodes_output
-    nodes_output=$(k0s kubectl get nodes -o wide 2>&1)
+    nodes_output=$(k0s kubectl get node -o wide 2>&1)
     if [ $? -eq 0 ]; then
         echo "$nodes_output"
         local node_count
@@ -1381,36 +1392,43 @@ list_available_versions() {
 }
 
 check_versions() {
-    echo -e "${YELLOW}======== Version Check ========${NC}"
-    echo "1. Check k0s Version"
-    echo "2. Check Kairos Version"
-    echo "3. Check Cilium Version"
-    echo "4. Check FluxCD Version"
-    echo "5. Check Script Version"
-    echo "6. List Available Versions"
-    echo "7. Check All Versions"
-    echo "8. Back to Main Menu"
-    read -p "Enter your choice: " check_choice
+    while true; do
+        echo -e "${YELLOW}======== Version Check ========${NC}"
+        echo "1. Check k0s Version"
+        echo "2. Check Kairos Version"
+        echo "3. Check Cilium Version"
+        echo "4. Check FluxCD Version"
+        echo "5. Check Script Version"
+        echo "6. List Available Versions"
+        echo "7. Check All Versions"
+        echo "8. Back to Main Menu"
+        if ! read -p "Enter your choice: " check_choice; then
+            echo ""
+            print_info "Input closed. Returning to main menu."
+            return 0
+        fi
 
-    case $check_choice in
-        1) check_k0s_version ;;
-        2) check_kairos_version ;;
-        3) check_cilium_version ;;
-        4) check_fluxcd_version ;;
-        5) check_script_version ;;
-        6) list_available_versions ;;
-        7)
-            check_k0s_version; echo ""
-            check_kairos_version; echo ""
-            check_cilium_version; echo ""
-            check_fluxcd_version; echo ""
-            check_script_version; echo ""
-            read -p "Would you like to see all available versions? (y/n): " list_choice
-            [ "$list_choice" = "y" ] && list_available_versions
-            ;;
-        8) return ;;
-        *) print_error "Invalid option. Returning to main menu." ;;
-    esac
+        case $check_choice in
+            1) check_k0s_version ;;
+            2) check_kairos_version ;;
+            3) check_cilium_version ;;
+            4) check_fluxcd_version ;;
+            5) check_script_version ;;
+            6) list_available_versions ;;
+            7)
+                check_k0s_version; echo ""
+                check_kairos_version; echo ""
+                check_cilium_version; echo ""
+                check_fluxcd_version; echo ""
+                check_script_version; echo ""
+                read -p "Would you like to see all available versions? (y/n): " list_choice
+                [ "$list_choice" = "y" ] && list_available_versions
+                ;;
+            8) return 0 ;;
+            "") continue ;;
+            *) print_error "Invalid option." ;;
+        esac
+    done
 }
 
 upgrade_cilium() {
