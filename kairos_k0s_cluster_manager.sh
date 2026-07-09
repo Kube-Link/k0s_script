@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.7"
+SCRIPT_VERSION="1.0.8"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -791,6 +791,257 @@ BUNDLEEOF
     print_successful "Controller join cloud-config written to ${OUTPUT_FILE}"
     print_info "Inject to ${NODE_IP}: curl -X POST -F 'cloud-config=@${OUTPUT_FILE}' http://${NODE_IP}:8080/install"
     print_info "Validate with: docker run -ti -v \"\$PWD\":/test --entrypoint /usr/bin/kairos-agent --rm quay.io/kairos/hadron:v0.4.0-core-amd64-generic-${KAIROS_IMAGE_VERSION} validate /test/${OUTPUT_FILE}"
+}
+
+# -----------------------------------------------------------------------------
+# Kairos Web Installer injection
+# -----------------------------------------------------------------------------
+normalize_installer_url() {
+    local target="$1"
+    target="${target%/}"
+
+    case "$target" in
+        http://*|https://*) echo "$target" ;;
+        *:*) echo "http://${target}" ;;
+        *) echo "http://${target}:8080" ;;
+    esac
+}
+
+controller_join_cloudconfig_file_for_ip() {
+    local node_ip="$1"
+    local node_octet
+    node_octet=$(echo "$node_ip" | cut -d. -f4)
+    echo "controller-join-cloud-config-${node_octet}.yaml"
+}
+
+worker_cloudconfig_file_for_ip() {
+    local node_ip="$1"
+    local node_octet
+    node_octet=$(echo "$node_ip" | cut -d. -f4)
+    echo "worker-cloud-config-${node_octet}.yaml"
+}
+
+inject_cloudconfig_webinstaller() {
+    local preset_file="$1"
+    local preset_target="$2"
+
+    print_info "Injecting cloud-config into Kairos Web Installer..."
+
+    if ! command -v curl &>/dev/null; then
+        print_error "curl not found. Cannot submit to the web installer."
+        return 1
+    fi
+
+    local cloud_config_file
+    if [ -n "$preset_file" ]; then
+        cloud_config_file="$preset_file"
+        print_info "Cloud-config file: ${cloud_config_file}"
+    else
+        print_info "Available YAML files:"
+        ls *.yaml 2>/dev/null || print_warning "No YAML files found in the current directory."
+
+        read -p "Cloud-config file (default: ${CONTROLLER_CC_FILE}): " cloud_config_file
+        cloud_config_file=${cloud_config_file:-$CONTROLLER_CC_FILE}
+    fi
+
+    if [ ! -f "$cloud_config_file" ]; then
+        print_error "Cloud-config file not found: $cloud_config_file"
+        return 1
+    fi
+
+    local default_target=""
+    if [ -n "${CONTROLLER_IP:-}" ]; then
+        default_target="http://${CONTROLLER_IP}:8080"
+    fi
+
+    local target
+    if [ -n "$preset_target" ]; then
+        target="$preset_target"
+        print_info "Installer target: ${target}"
+    elif [ -n "$default_target" ]; then
+        read -p "Installer IP or URL (default: ${default_target}): " target
+        target=${target:-$default_target}
+    else
+        read -p "Installer IP or URL (example: 172.20.1.1:8080): " target
+    fi
+
+    if [ -z "$target" ]; then
+        print_error "No installer target provided."
+        return 1
+    fi
+
+    local installer_url
+    installer_url=$(normalize_installer_url "$target")
+
+    local install_device
+    read -p "Install device (default: auto): " install_device
+    install_device=${install_device:-auto}
+
+    local reboot_after
+    read -p "Reboot after installation? (y/n, default: n): " reboot_after
+    reboot_after=${reboot_after:-n}
+
+    local poweroff_default="y"
+    case "$reboot_after" in
+        y|Y|yes|YES) poweroff_default="n" ;;
+    esac
+
+    local poweroff_after
+    read -p "Power off after installation? (y/n, default: ${poweroff_default}): " poweroff_after
+    poweroff_after=${poweroff_after:-$poweroff_default}
+
+    print_info "Validating cloud-config against ${installer_url}/validate..."
+    local validation_output
+    validation_output=$(curl -sS -X POST -F "cloud-config=<${cloud_config_file}" "${installer_url}/validate" 2>&1)
+    local validation_rc=$?
+    if [ $validation_rc -ne 0 ]; then
+        print_error "Validation request failed:"
+        echo "$validation_output"
+        return 1
+    fi
+
+    if [ -n "$validation_output" ]; then
+        print_error "Installer validation failed:"
+        echo "$validation_output"
+        return 1
+    fi
+
+    print_successful "Cloud-config validated successfully."
+    print_warning "This will install Kairos using:"
+    print_warning "  URL: ${installer_url}/install"
+    print_warning "  Config: ${cloud_config_file}"
+    print_warning "  Device: ${install_device}"
+    print_warning "  Reboot: ${reboot_after}"
+    print_warning "  Power off: ${poweroff_after}"
+    read -p "Type INSTALL to submit and start installation: " confirm_install
+    if [ "$confirm_install" != "INSTALL" ]; then
+        print_warning "Install cancelled."
+        return 0
+    fi
+
+    local curl_args=(-X POST -F "cloud-config=<${cloud_config_file}" -F "installation-device=${install_device}")
+    case "$reboot_after" in
+        y|Y|yes|YES) curl_args+=(-F "reboot=on") ;;
+    esac
+    case "$poweroff_after" in
+        y|Y|yes|YES) curl_args+=(-F "power-off=on") ;;
+    esac
+
+    print_info "Submitting install request..."
+    if curl -S "${curl_args[@]}" "${installer_url}/install"; then
+        print_successful "Install request submitted."
+    else
+        print_error "Install request failed."
+        return 1
+    fi
+}
+
+inject_one_additional_controller() {
+    if [ ${#ADDITIONAL_CONTROLLERS[@]} -eq 0 ]; then
+        print_warning "No additional controllers configured."
+        return 0
+    fi
+
+    print_info "Additional controllers:"
+    local i
+    for i in "${!ADDITIONAL_CONTROLLERS[@]}"; do
+        local ctrl_ip="${ADDITIONAL_CONTROLLERS[$i]}"
+        echo "$((i + 1)). ${ctrl_ip} ($(controller_join_cloudconfig_file_for_ip "$ctrl_ip"))"
+    done
+
+    local selection ctrl_ip
+    read -p "Select controller number or enter IP: " selection
+    if [[ "$selection" =~ ^[0-9]+$ ]] && [ "$selection" -ge 1 ] && [ "$selection" -le ${#ADDITIONAL_CONTROLLERS[@]} ]; then
+        ctrl_ip="${ADDITIONAL_CONTROLLERS[$((selection - 1))]}"
+    else
+        ctrl_ip="$selection"
+    fi
+
+    if [ -z "$ctrl_ip" ]; then
+        print_error "No controller selected."
+        return 1
+    fi
+
+    inject_cloudconfig_webinstaller "$(controller_join_cloudconfig_file_for_ip "$ctrl_ip")" "$ctrl_ip"
+}
+
+inject_all_additional_controllers() {
+    if [ ${#ADDITIONAL_CONTROLLERS[@]} -eq 0 ]; then
+        print_warning "No additional controllers configured."
+        return 0
+    fi
+
+    local ctrl_ip
+    for ctrl_ip in "${ADDITIONAL_CONTROLLERS[@]}"; do
+        inject_cloudconfig_webinstaller "$(controller_join_cloudconfig_file_for_ip "$ctrl_ip")" "$ctrl_ip" || return 1
+    done
+}
+
+inject_one_worker() {
+    if [ ${#WORKERS[@]} -eq 0 ]; then
+        print_warning "No workers configured."
+        return 0
+    fi
+
+    print_info "Workers:"
+    local i
+    for i in "${!WORKERS[@]}"; do
+        local worker_ip="${WORKERS[$i]}"
+        echo "$((i + 1)). ${worker_ip} ($(worker_cloudconfig_file_for_ip "$worker_ip"))"
+    done
+
+    local selection worker_ip
+    read -p "Select worker number or enter IP: " selection
+    if [[ "$selection" =~ ^[0-9]+$ ]] && [ "$selection" -ge 1 ] && [ "$selection" -le ${#WORKERS[@]} ]; then
+        worker_ip="${WORKERS[$((selection - 1))]}"
+    else
+        worker_ip="$selection"
+    fi
+
+    if [ -z "$worker_ip" ]; then
+        print_error "No worker selected."
+        return 1
+    fi
+
+    inject_cloudconfig_webinstaller "$(worker_cloudconfig_file_for_ip "$worker_ip")" "$worker_ip"
+}
+
+inject_all_workers() {
+    if [ ${#WORKERS[@]} -eq 0 ]; then
+        print_warning "No workers configured."
+        return 0
+    fi
+
+    local worker_ip
+    for worker_ip in "${WORKERS[@]}"; do
+        inject_cloudconfig_webinstaller "$(worker_cloudconfig_file_for_ip "$worker_ip")" "$worker_ip" || return 1
+    done
+}
+
+manage_web_installer() {
+    while true; do
+        echo -e "\n${YELLOW}======== Kairos Web Installer ========${NC}"
+        echo "1. Install primary controller (${CONTROLLER_IP})"
+        echo "2. Install one additional controller"
+        echo "3. Install all additional controllers"
+        echo "4. Install one worker"
+        echo "5. Install all workers"
+        echo "6. Custom YAML / installer target"
+        echo "7. Back"
+        echo -e "${YELLOW}======================================${NC}"
+        read -p "Enter your choice: " web_choice
+
+        case $web_choice in
+            1) inject_cloudconfig_webinstaller "$CONTROLLER_CC_FILE" "$CONTROLLER_IP" ;;
+            2) inject_one_additional_controller ;;
+            3) inject_all_additional_controllers ;;
+            4) inject_one_worker ;;
+            5) inject_all_workers ;;
+            6) inject_cloudconfig_webinstaller ;;
+            7) return 0 ;;
+            *) print_error "Invalid option." ;;
+        esac
+    done
 }
 
 # -----------------------------------------------------------------------------
@@ -1862,7 +2113,8 @@ while true; do
     echo "12. Rolling OS Upgrade (A/B)"
     echo "13. Show Config File"
     echo "14. Setup SSH Keys"
-    echo "15. Exit"
+    echo "15. Kairos Web Installer (inject configs)"
+    echo "16. Exit"
     echo -e "${YELLOW}=================================================${NC}"
     read -p "Enter your choice: " choice
 
@@ -1881,7 +2133,8 @@ while true; do
         12) kairos_rolling_upgrade ;;
         13) show_config_file ;;
         14) setup_ssh_keys ;;
-        15) echo "Exiting..."; exit 0 ;;
+        15) ensure_config && manage_web_installer ;;
+        16) echo "Exiting..."; exit 0 ;;
         *) print_error "Invalid option." ;;
     esac
 done
