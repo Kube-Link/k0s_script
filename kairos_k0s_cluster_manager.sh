@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.29"
+SCRIPT_VERSION="1.0.30"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -86,17 +86,207 @@ print_github_ssh_key_guide() {
     print_info "The cloud-config uses github:${github_user}; the raw key is embedded as a fallback too."
 }
 
+trim_value() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
+prompt_yn() {
+    local result_var="$1"
+    local prompt="$2"
+    local default="$3"
+    local answer
+
+    while true; do
+        read -p "$prompt" answer || return 1
+        answer=${answer:-$default}
+        case "$answer" in
+            y|Y|yes|YES) printf -v "$result_var" '%s' "y"; return 0 ;;
+            n|N|no|NO) printf -v "$result_var" '%s' "n"; return 0 ;;
+            *) print_error "Please answer y or n." ;;
+        esac
+    done
+}
+
+write_config_value() {
+    local file="$1"
+    local key="$2"
+    local value="$3"
+
+    printf '%s=' "$key" >> "$file"
+    printf '%q\n' "$value" >> "$file"
+}
+
+write_config_array() {
+    local file="$1"
+    local key="$2"
+    shift 2
+
+    printf '%s=(' "$key" >> "$file"
+    local value
+    for value in "$@"; do
+        printf ' %q' "$value" >> "$file"
+    done
+    printf ' )\n' >> "$file"
+}
+
+format_config_value_line() {
+    local key="$1"
+    local value="$2"
+    local quoted
+
+    printf -v quoted '%q' "$value"
+    printf '%s=%s' "$key" "$quoted"
+}
+
+format_config_array_line() {
+    local key="$1"
+    shift
+    local line="${key}=("
+    local value
+    local quoted
+
+    for value in "$@"; do
+        printf -v quoted '%q' "$value"
+        line="${line} ${quoted}"
+    done
+    line="${line} )"
+    printf '%s' "$line"
+}
+
+upsert_config_line() {
+    local file="$1"
+    local key="$2"
+    local line="$3"
+    local tmp_file="${file}.tmp.$$"
+
+    if [ -f "$file" ] && grep -q "^${key}=" "$file" 2>/dev/null; then
+        awk -v key="$key" -v line="$line" '
+            BEGIN { replaced = 0 }
+            $0 ~ "^" key "=" {
+                if (!replaced) {
+                    print line
+                    replaced = 1
+                }
+                next
+            }
+            { print }
+            END {
+                if (!replaced) {
+                    print line
+                }
+            }
+        ' "$file" > "$tmp_file" && mv "$tmp_file" "$file"
+    else
+        printf '%s\n' "$line" >> "$file"
+    fi
+}
+
+upsert_config_value() {
+    local file="$1"
+    local key="$2"
+    local value="$3"
+
+    upsert_config_line "$file" "$key" "$(format_config_value_line "$key" "$value")"
+}
+
+upsert_config_array() {
+    local file="$1"
+    local key="$2"
+    shift 2
+
+    upsert_config_line "$file" "$key" "$(format_config_array_line "$key" "$@")"
+}
+
+validate_unique_nodes() {
+    local seen=()
+    local node
+    local existing
+
+    for node in "$@"; do
+        [ -z "$node" ] && continue
+        for existing in "${seen[@]}"; do
+            if [ "$node" = "$existing" ]; then
+                print_error "Duplicate node IP in config: $node"
+                return 1
+            fi
+        done
+        seen+=("$node")
+    done
+}
+
+validate_config_file() {
+    local file="$1"
+
+    if [ ! -f "$file" ]; then
+        print_error "Config file $file not found."
+        return 1
+    fi
+
+    if ! bash -n "$file" 2>/dev/null; then
+        print_error "Config file has shell syntax errors: $file"
+        bash -n "$file"
+        return 1
+    fi
+
+    local duplicate_keys
+    duplicate_keys=$(awk -F= '/^[[:space:]]*[A-Z_][A-Z0-9_]*=/{key=$1; sub(/^[[:space:]]*/, "", key); count[key]++} END{for (key in count) if (count[key] > 1) print key}' "$file")
+    if [ -n "$duplicate_keys" ]; then
+        print_error "Config file has duplicate keys. Regenerate it with option 1."
+        echo "$duplicate_keys"
+        return 1
+    fi
+
+    local validation_output
+    validation_output=$(bash -c '
+        source "$1" || exit 1
+        failed=0
+        for key in CONTROLLER_COUNT CONTROLLER_WORKER CONTROLLER_IP ADDITIONAL_CONTROLLERS WORKERS CLUSTER_NAME POD_CIDR SERVICE_CIDR INSTALL_CILIUM GITHUB_USER SSH_PUBKEY HYPERVISOR; do
+            if ! declare -p "$key" >/dev/null 2>&1; then
+                echo "Missing required config key: $key"
+                failed=1
+            fi
+        done
+        case "${CONTROLLER_WORKER:-}" in
+            y|n) ;;
+            *) echo "CONTROLLER_WORKER must be y or n."; failed=1 ;;
+        esac
+        case "${INSTALL_CILIUM:-}" in
+            y|n) ;;
+            *) echo "INSTALL_CILIUM must be y or n."; failed=1 ;;
+        esac
+        if [ "${#ADDITIONAL_CONTROLLERS[@]}" -ne 2 ]; then
+            echo "Exactly 2 additional controller IPs are required."
+            failed=1
+        fi
+        if [ "${CONTROLLER_WORKER:-n}" = "n" ] && [ "${#WORKERS[@]}" -eq 0 ]; then
+            echo "At least one worker IP is required when controllers are controller-only."
+            failed=1
+        fi
+        exit "$failed"
+    ' _ "$file" 2>&1)
+
+    if [ $? -ne 0 ]; then
+        print_error "Config file validation failed: $file"
+        printf '%s\n' "$validation_output"
+        return 1
+    fi
+}
+
 # -----------------------------------------------------------------------------
 # Config file (shell vars, consumed by this script — NOT the cloud-config)
 # -----------------------------------------------------------------------------
 generate_config_file() {
     print_info "Generating Kairos/k0s config file..."
     echo ""
+    local tmp_config="${CONFIG_FILE}.tmp.$$"
+    rm -f "$tmp_config"
 
     # --- Cluster topology ---
     # k0s etcd requires odd number of controllers; 3 is the practical HA choice
     CONTROLLER_COUNT=3
-    echo "CONTROLLER_COUNT=$CONTROLLER_COUNT" > "$CONFIG_FILE"
 
     print_info "Cluster topology (3-controller HA):"
     print_info "  Option A: 3 controllers + X workers  — dedicated control plane"
@@ -104,48 +294,64 @@ generate_config_file() {
     echo ""
 
     # --- Controller role ---
-    read -p "Enable worker role on controllers? (y/n, default: n): " CONTROLLER_WORKER
-    CONTROLLER_WORKER=${CONTROLLER_WORKER:-n}
-    echo "CONTROLLER_WORKER=$CONTROLLER_WORKER" >> "$CONFIG_FILE"
+    prompt_yn CONTROLLER_WORKER "Enable worker role on controllers? (y/n, default: n): " "n" || return 1
 
-    read -p "Enter primary controller IP: " CONTROLLER_IP
-    echo "CONTROLLER_IP=$CONTROLLER_IP" >> "$CONFIG_FILE"
+    read -p "Enter primary controller IP: " CONTROLLER_IP || return 1
+    CONTROLLER_IP=$(trim_value "$CONTROLLER_IP")
+    if [ -z "$CONTROLLER_IP" ]; then
+        print_error "Primary controller IP is required."
+        return 1
+    fi
 
     print_info "Enter the 2 additional HA controller IPs (these will join the cluster)."
-    read -p "Additional controller IPs (comma-separated): " ADDITIONAL_INPUT
-    IFS=',' read -ra ADDITIONAL_CONTROLLERS <<< "$ADDITIONAL_INPUT"
+    read -p "Additional controller IPs (comma-separated): " ADDITIONAL_INPUT || return 1
+    IFS=',' read -ra ADDITIONAL_CONTROLLERS_RAW <<< "$ADDITIONAL_INPUT"
+    ADDITIONAL_CONTROLLERS=()
+    local item
+    for item in "${ADDITIONAL_CONTROLLERS_RAW[@]}"; do
+        item=$(trim_value "$item")
+        [ -n "$item" ] && ADDITIONAL_CONTROLLERS+=("$item")
+    done
     if [ "${#ADDITIONAL_CONTROLLERS[@]}" -ne 2 ]; then
         print_error "Exactly 2 additional controller IPs required for HA (3 total)."
         return 1
     fi
-    echo "ADDITIONAL_CONTROLLERS=(${ADDITIONAL_CONTROLLERS[@]})" >> "$CONFIG_FILE"
 
     if [ "$CONTROLLER_WORKER" = "y" ]; then
-        echo "WORKERS=()" >> "$CONFIG_FILE"
+        WORKERS=()
         print_info "Controllers will run workloads — no separate workers needed."
     else
-        read -p "Enter worker IPs (comma-separated): " WORKERS_INPUT
-        IFS=',' read -ra WORKERS <<< "$WORKERS_INPUT"
-        echo "WORKERS=(${WORKERS[@]})" >> "$CONFIG_FILE"
+        read -p "Enter worker IPs (comma-separated): " WORKERS_INPUT || return 1
+        IFS=',' read -ra WORKERS_RAW <<< "$WORKERS_INPUT"
+        WORKERS=()
+        for item in "${WORKERS_RAW[@]}"; do
+            item=$(trim_value "$item")
+            [ -n "$item" ] && WORKERS+=("$item")
+        done
+        if [ "${#WORKERS[@]}" -eq 0 ]; then
+            print_error "At least one worker IP is required when controllers are controller-only."
+            return 1
+        fi
     fi
 
-    read -p "Enter cluster name (default: $DEFAULT_CLUSTER_NAME): " CLUSTER_NAME
+    validate_unique_nodes "$CONTROLLER_IP" "${ADDITIONAL_CONTROLLERS[@]}" "${WORKERS[@]}" || return 1
+
+    read -p "Enter cluster name (default: $DEFAULT_CLUSTER_NAME): " CLUSTER_NAME || return 1
     CLUSTER_NAME=${CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}
-    echo "CLUSTER_NAME=$CLUSTER_NAME" >> "$CONFIG_FILE"
+    CLUSTER_NAME=$(trim_value "$CLUSTER_NAME")
 
-    read -p "Enter Pod CIDR (default: $DEFAULT_POD_CIDR): " POD_CIDR
+    read -p "Enter Pod CIDR (default: $DEFAULT_POD_CIDR): " POD_CIDR || return 1
     POD_CIDR=${POD_CIDR:-$DEFAULT_POD_CIDR}
-    echo "POD_CIDR=$POD_CIDR" >> "$CONFIG_FILE"
+    POD_CIDR=$(trim_value "$POD_CIDR")
 
-    read -p "Enter Service CIDR (default: $DEFAULT_SERVICE_CIDR): " SERVICE_CIDR
+    read -p "Enter Service CIDR (default: $DEFAULT_SERVICE_CIDR): " SERVICE_CIDR || return 1
     SERVICE_CIDR=${SERVICE_CIDR:-$DEFAULT_SERVICE_CIDR}
-    echo "SERVICE_CIDR=$SERVICE_CIDR" >> "$CONFIG_FILE"
+    SERVICE_CIDR=$(trim_value "$SERVICE_CIDR")
 
-    read -p "Auto-install Cilium after all workers are installed and registered (y/n)? " INSTALL_CILIUM
-    echo "INSTALL_CILIUM=$INSTALL_CILIUM" >> "$CONFIG_FILE"
+    prompt_yn INSTALL_CILIUM "Auto-install Cilium after all workers are installed and registered? (y/n, default: n): " "n" || return 1
 
-    read -p "GitHub username for SSH key injection: " GITHUB_USER
-    echo "GITHUB_USER=$GITHUB_USER" >> "$CONFIG_FILE"
+    read -p "GitHub username for SSH key injection: " GITHUB_USER || return 1
+    GITHUB_USER=$(trim_value "$GITHUB_USER")
 
     # Auto-discover or generate SSH key
     print_info "SSH key for cloud-config injection..."
@@ -163,16 +369,16 @@ generate_config_file() {
     fi
 
     if [ -n "$SSH_KEY" ]; then
-        read -p "Use this key? (y/n, default: y): " use_key
-        if [ "${use_key:-y}" = "y" ]; then
+        prompt_yn use_key "Use this key? (y/n, default: y): " "y" || return 1
+        if [ "$use_key" = "y" ]; then
             SSH_PUBKEY=$(cat "$SSH_KEY.pub")
         fi
     fi
 
     # No key found or user declined — offer to generate or paste
     if [ -z "$SSH_PUBKEY" ]; then
-        read -p "No key selected. Generate a new one? (y/n, default: y): " gen_key
-        if [ "${gen_key:-y}" = "y" ]; then
+        prompt_yn gen_key "No key selected. Generate a new one? (y/n, default: y): " "y" || return 1
+        if [ "$gen_key" = "y" ]; then
             mkdir -p "$SSH_DIR" 2>/dev/null
             chmod 700 "$SSH_DIR" 2>/dev/null
             ssh-keygen -t ed25519 -f "$SSH_DIR/id_ed25519_kairos" -N "" -C "kairos-cluster-key" 2>/dev/null
@@ -184,10 +390,9 @@ generate_config_file() {
                 read -p "Paste your SSH public key manually: " SSH_PUBKEY
             fi
         else
-            read -p "Paste your SSH public key manually (or leave blank to skip): " SSH_PUBKEY
+            read -p "Paste your SSH public key manually (or leave blank to skip): " SSH_PUBKEY || return 1
         fi
     fi
-    echo "SSH_PUBKEY='$SSH_PUBKEY'" >> "$CONFIG_FILE"
 
     # Remind user to upload to GitHub so the native github: mechanism works too
     if [ -n "$SSH_PUBKEY" ] && [ -n "$GITHUB_USER" ]; then
@@ -197,9 +402,30 @@ generate_config_file() {
         read -p "Press Enter to continue..."
     fi
 
-    read -p "Hypervisor (proxmox/hyperv): " HYPERVISOR
+    read -p "Hypervisor (proxmox/hyperv): " HYPERVISOR || return 1
     HYPERVISOR=${HYPERVISOR:-proxmox}
-    echo "HYPERVISOR=$HYPERVISOR" >> "$CONFIG_FILE"
+    HYPERVISOR=$(trim_value "$HYPERVISOR")
+
+    write_config_value "$tmp_config" "CONTROLLER_COUNT" "$CONTROLLER_COUNT"
+    write_config_value "$tmp_config" "CONTROLLER_WORKER" "$CONTROLLER_WORKER"
+    write_config_value "$tmp_config" "CONTROLLER_IP" "$CONTROLLER_IP"
+    write_config_array "$tmp_config" "ADDITIONAL_CONTROLLERS" "${ADDITIONAL_CONTROLLERS[@]}"
+    write_config_array "$tmp_config" "WORKERS" "${WORKERS[@]}"
+    write_config_value "$tmp_config" "CLUSTER_NAME" "$CLUSTER_NAME"
+    write_config_value "$tmp_config" "POD_CIDR" "$POD_CIDR"
+    write_config_value "$tmp_config" "SERVICE_CIDR" "$SERVICE_CIDR"
+    write_config_value "$tmp_config" "INSTALL_CILIUM" "$INSTALL_CILIUM"
+    write_config_value "$tmp_config" "GITHUB_USER" "$GITHUB_USER"
+    write_config_value "$tmp_config" "SSH_PUBKEY" "$SSH_PUBKEY"
+    write_config_value "$tmp_config" "HYPERVISOR" "$HYPERVISOR"
+
+    if ! validate_config_file "$tmp_config"; then
+        print_error "New config failed validation. Existing $CONFIG_FILE was not changed."
+        rm -f "$tmp_config"
+        return 1
+    fi
+
+    mv "$tmp_config" "$CONFIG_FILE"
 
     # TODO: Proxmox VM ID range, ISO output path, registry for custom images
 
@@ -224,6 +450,8 @@ ensure_config() {
         read -p "Generate now? (y/n): " gen
         [ "$gen" = "y" ] && generate_config_file || return 1
     fi
+
+    validate_config_file "$CONFIG_FILE" || return 1
     source "$CONFIG_FILE"
 }
 
@@ -1838,12 +2066,12 @@ EOF
     print_successful "BGP configuration files generated in ./bgp_config/ directory"
 
     if [ -f "$CONFIG_FILE" ]; then
-        echo "CLUSTER_ASN=$CLUSTER_ASN" >> "$CONFIG_FILE"
-        echo "PEER_ASN=$PEER_ASN" >> "$CONFIG_FILE"
-        echo "PEER_IP=$PEER_IP" >> "$CONFIG_FILE"
-        echo "NODE_HOSTNAMES=(${NODE_HOSTNAMES[@]})" >> "$CONFIG_FILE"
-        echo "LB_IP_START=$LB_IP_START" >> "$CONFIG_FILE"
-        echo "LB_IP_END=$LB_IP_END" >> "$CONFIG_FILE"
+        upsert_config_value "$CONFIG_FILE" "CLUSTER_ASN" "$CLUSTER_ASN"
+        upsert_config_value "$CONFIG_FILE" "PEER_ASN" "$PEER_ASN"
+        upsert_config_value "$CONFIG_FILE" "PEER_IP" "$PEER_IP"
+        upsert_config_array "$CONFIG_FILE" "NODE_HOSTNAMES" "${NODE_HOSTNAMES[@]}"
+        upsert_config_value "$CONFIG_FILE" "LB_IP_START" "$LB_IP_START"
+        upsert_config_value "$CONFIG_FILE" "LB_IP_END" "$LB_IP_END"
         print_info "BGP configuration saved to $CONFIG_FILE"
     fi
 }
@@ -2792,11 +3020,7 @@ setup_ssh_keys() {
 
     # Save to config file so cloud-config generation picks it up automatically
     if [ -f "$CONFIG_FILE" ]; then
-        if grep -q "^SSH_PUBKEY=" "$CONFIG_FILE" 2>/dev/null; then
-            sed -i "s|^SSH_PUBKEY=.*|SSH_PUBKEY='$PUBLIC_KEY'|" "$CONFIG_FILE"
-        else
-            echo "SSH_PUBKEY='$PUBLIC_KEY'" >> "$CONFIG_FILE"
-        fi
+        upsert_config_value "$CONFIG_FILE" "SSH_PUBKEY" "$PUBLIC_KEY"
         print_successful "Public key saved to $CONFIG_FILE"
     fi
 
