@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.18"
+SCRIPT_VERSION="1.0.19"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -2610,11 +2610,11 @@ setup_ssh_keys() {
 # -----------------------------------------------------------------------------
 while true; do
     echo -e "\n${YELLOW}======== Kairos + k0s Cluster Management (v${SCRIPT_VERSION}) ========${NC}"
-    echo "1.  Generate Config File (settings)"
-    echo "2.  Generate Controller Cloud-Config (init)"
-    echo "3.  Generate Controller Join Token + Cloud-Config (HA)"
-    echo "4.  Generate Worker Token + Cloud-Config"
-    echo "5.  Kairos Web Installer (inject configs)"
+    echo "1.  Generate Config File (cluster settings)"
+    echo "2.  Generate Controller Cloud-Config (first controller)"
+    echo "3.  Generate Controller Join Token + Cloud-Config (additional controllers)"
+    echo "4.  Generate Worker Token + Cloud-Config (worker nodes)"
+    echo "5.  Kairos Web Installer (send config to installer)"
     echo "6.  Generate Kairos Dockerfile (image build)"
     echo "7.  Manage Cilium (install / upgrade / status)"
     echo "8.  Manage FluxCD"
