@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.8"
+SCRIPT_VERSION="1.0.9"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -356,10 +356,9 @@ bind_mounts:
 
 stages:
   boot:
-    - name: "Update cluster manager script (every boot)"
+    - name: "Update cluster manager script if remote copy is valid"
       commands:
-        - curl -sL https://raw.githubusercontent.com/Kube-Link/k0s_script/master/kairos_k0s_cluster_manager.sh -o /root/kairos-cluster-manager.sh
-        - chmod +x /root/kairos-cluster-manager.sh
+        - tmp=/root/kairos-cluster-manager.sh.new; if curl -fsSL --retry 3 --connect-timeout 10 https://raw.githubusercontent.com/Kube-Link/k0s_script/master/kairos_k0s_cluster_manager.sh -o "$tmp" && head -n 1 "$tmp" | grep -q '^#!/bin/bash' && bash -n "$tmp"; then mv "$tmp" /root/kairos-cluster-manager.sh && chmod +x /root/kairos-cluster-manager.sh; else echo "Skipping cluster manager update; remote download was invalid"; rm -f "$tmp"; fi
 # Longhorn requirement
   boot.after:
     - name: "Enable iSCSI"
@@ -499,10 +498,9 @@ bind_mounts:
 
 stages:
   boot:
-    - name: "Update cluster manager script (every boot)"
+    - name: "Update cluster manager script if remote copy is valid"
       commands:
-        - curl -sL https://raw.githubusercontent.com/Kube-Link/k0s_script/master/kairos_k0s_cluster_manager.sh -o /root/kairos-cluster-manager.sh
-        - chmod +x /root/kairos-cluster-manager.sh
+        - tmp=/root/kairos-cluster-manager.sh.new; if curl -fsSL --retry 3 --connect-timeout 10 https://raw.githubusercontent.com/Kube-Link/k0s_script/master/kairos_k0s_cluster_manager.sh -o "$tmp" && head -n 1 "$tmp" | grep -q '^#!/bin/bash' && bash -n "$tmp"; then mv "$tmp" /root/kairos-cluster-manager.sh && chmod +x /root/kairos-cluster-manager.sh; else echo "Skipping cluster manager update; remote download was invalid"; rm -f "$tmp"; fi
   boot.after:
     - name: "Enable iSCSI"
       commands:
@@ -755,10 +753,9 @@ bind_mounts:
 
 stages:
   boot:
-    - name: "Update cluster manager script (every boot)"
+    - name: "Update cluster manager script if remote copy is valid"
       commands:
-        - curl -sL https://raw.githubusercontent.com/Kube-Link/k0s_script/master/kairos_k0s_cluster_manager.sh -o /root/kairos-cluster-manager.sh
-        - chmod +x /root/kairos-cluster-manager.sh
+        - tmp=/root/kairos-cluster-manager.sh.new; if curl -fsSL --retry 3 --connect-timeout 10 https://raw.githubusercontent.com/Kube-Link/k0s_script/master/kairos_k0s_cluster_manager.sh -o "$tmp" && head -n 1 "$tmp" | grep -q '^#!/bin/bash' && bash -n "$tmp"; then mv "$tmp" /root/kairos-cluster-manager.sh && chmod +x /root/kairos-cluster-manager.sh; else echo "Skipping cluster manager update; remote download was invalid"; rm -f "$tmp"; fi
   boot.after:
     - name: "Enable iSCSI"
       commands:
