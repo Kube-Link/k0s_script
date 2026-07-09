@@ -45,12 +45,26 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.6"
+SCRIPT_VERSION="1.0.7"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
 DEFAULT_SERVICE_CIDR="10.96.0.0/12"
 DEFAULT_CLUSTER_NAME="homelab"
+
+build_controller_k0s_args() {
+    local include_token="${1:-false}"
+
+    printf '    - --config=%s\n' "$K0S_CONFIG_PATH"
+    if [ "$include_token" = "true" ]; then
+        printf '    - --token-file=%s\n' "$K0S_TOKEN_FILE"
+    fi
+
+    if [ "${CONTROLLER_WORKER:-n}" = "y" ]; then
+        printf '    - --enable-worker\n'
+        printf '    - --no-taints\n'
+    fi
+}
 
 # -----------------------------------------------------------------------------
 # Config file (shell vars, consumed by this script — NOT the cloud-config)
@@ -70,8 +84,8 @@ generate_config_file() {
     echo ""
 
     # --- Controller role ---
-    read -p "Enable worker role on controllers? (y/n, default: y): " CONTROLLER_WORKER
-    CONTROLLER_WORKER=${CONTROLLER_WORKER:-y}
+    read -p "Enable worker role on controllers? (y/n, default: n): " CONTROLLER_WORKER
+    CONTROLLER_WORKER=${CONTROLLER_WORKER:-n}
     echo "CONTROLLER_WORKER=$CONTROLLER_WORKER" >> "$CONFIG_FILE"
 
     read -p "Enter primary controller IP: " CONTROLLER_IP
@@ -256,6 +270,9 @@ config_url: \"${CONFIG_URL}\""
     # Compute hostname from controller IP (known at generation time)
     local CTRL_HOSTNAME="${CLUSTER_NAME}-ctrl-$(echo ${CONTROLLER_IP} | cut -d. -f4)"
 
+    local K0S_ARGS
+    K0S_ARGS=$(build_controller_k0s_args false)
+
     # Base64-encode script for compact embedding (avoids YAML indentation bloat)
     local SCRIPT_B64=$(base64 -w0 "$0" 2>/dev/null || base64 "$0" | tr -d '\n')
 
@@ -280,8 +297,7 @@ ${INSTALL_BLOCK}
 k0s:
   enabled: true
   args:
-    - --config=${K0S_CONFIG_PATH}
-    - --enable-worker
+${K0S_ARGS}
 
 write_files:
   - path: ${K0S_CONFIG_PATH}
@@ -628,6 +644,9 @@ generate_controller_join_cloudconfig() {
     # Per-node output file: controller-join-cloud-config-2.yaml, etc.
     local OUTPUT_FILE="controller-join-cloud-config-${NODE_OCTET}.yaml"
 
+    local K0S_ARGS
+    K0S_ARGS=$(build_controller_k0s_args true)
+
     print_info "Generating controller join cloud-config for ${NODE_HOSTNAME} (${NODE_IP}) → ${OUTPUT_FILE}..."
 
     # Install block — auto-install with nousers:true is REQUIRED for curl injection
@@ -674,8 +693,7 @@ ${INSTALL_BLOCK}
 k0s:
   enabled: true
   args:
-    - --config=${K0S_CONFIG_PATH}
-    - --enable-worker
+${K0S_ARGS}
 
 write_files:
   - path: ${K0S_CONFIG_PATH}
@@ -1815,12 +1833,12 @@ setup_ssh_keys() {
         ensure_config || return 1
         generate_controller_cloudconfig
         if [ -f ".k0s_controller_token" ]; then
-            generate_controller_join_cloudconfig "$(cat .k0s_controller_token)"
+            generate_controller_token
         fi
         if [ -f ".k0s_worker_token" ]; then
-            generate_worker_cloudconfig "$(cat .k0s_worker_token)"
+            generate_worker_token
         else
-            print_info "No worker token found — generate one (option 5) before regenerating worker cloud-config."
+            print_info "No worker token found — generate one (option 4) before regenerating worker cloud-config."
         fi
     fi
 }
