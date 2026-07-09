@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.9"
+SCRIPT_VERSION="1.0.13"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -1193,21 +1193,69 @@ check_script_version() {
 
 check_cluster_status() {
     print_info "Checking cluster status (local)..."
-    if command -v k0s &>/dev/null; then
-        k0s kubectl get nodes -o wide 2>/dev/null || \
-            print_error "Cannot connect to cluster. Is k0s running?"
-    else
+
+    if ! command -v k0s &>/dev/null; then
         print_error "k0s not found on this node."
+        return 1
     fi
 
-    # Also show Cilium status if installed
+    print_info "k0s status:"
+    k0s status 2>/dev/null || print_warning "Unable to read k0s status."
+    echo ""
+
+    print_info "Kubernetes API readiness:"
+    local api_ready
+    api_ready=$(k0s kubectl get --raw=/readyz 2>&1)
+    if [ $? -eq 0 ]; then
+        print_successful "API readyz: ${api_ready}"
+    else
+        print_warning "API readyz failed:"
+        echo "$api_ready"
+    fi
+    echo ""
+
+    print_info "Registered Kubernetes nodes:"
+    local nodes_output
+    nodes_output=$(k0s kubectl get nodes -o wide 2>&1)
+    if [ $? -eq 0 ]; then
+        echo "$nodes_output"
+        local node_count
+        node_count=$(echo "$nodes_output" | awk 'NR > 1 && NF { count++ } END { print count + 0 }')
+        if [ "$node_count" -eq 0 ]; then
+            print_info "No worker nodes are registered yet. This is expected for controller-only bootstrap before workers join."
+        fi
+    else
+        print_warning "Could not list nodes:"
+        echo "$nodes_output"
+    fi
+    echo ""
+
+    print_info "Cluster pods:"
+    local pods_output
+    pods_output=$(k0s kubectl get pods -A -o wide 2>&1)
+    if [ $? -eq 0 ]; then
+        echo "$pods_output"
+    else
+        print_warning "Could not list pods:"
+        echo "$pods_output"
+    fi
+
     echo ""
     if command -v cilium &>/dev/null; then
         print_info "Cilium status:"
         cilium status 2>/dev/null || print_info "Cilium CLI found but unable to get status."
     else
-        print_info "Cilium CLI not installed — run 'Manage Cilium' to install."
+        if k0s kubectl get daemonset cilium -n kube-system &>/dev/null; then
+            print_info "Cilium CLI not installed, but Cilium pods were found:"
+            k0s kubectl get pods -n kube-system -l k8s-app=cilium -o wide 2>/dev/null
+        else
+            print_info "Cilium not detected yet. Run 'Manage Cilium' after the control plane is ready."
+        fi
     fi
+}
+
+github_release_tags() {
+    sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p'
 }
 
 # -----------------------------------------------------------------------------
@@ -1245,7 +1293,7 @@ check_cilium_version() {
             print_info "Checking latest stable Cilium version..."
             local latest_version
             latest_version=$(curl -s https://raw.githubusercontent.com/cilium/cilium/master/stable.txt 2>/dev/null)
-            [ -z "$latest_version" ] && latest_version=$(curl -s https://api.github.com/repos/cilium/cilium/releases/latest 2>/dev/null | grep -oP '"tag_name":\s*"\K[^"]+')
+            [ -z "$latest_version" ] && latest_version=$(curl -s https://api.github.com/repos/cilium/cilium/releases/latest 2>/dev/null | github_release_tags | head -n 1)
             print_successful "Latest Stable Cilium Version: $latest_version"
 
             if [ -n "$cilium_version" ] && [ "$cilium_version" = "$latest_version" ]; then
@@ -1257,14 +1305,14 @@ check_cilium_version() {
             print_info "Cilium CLI is installed, but Cilium is not detected in the cluster."
             local latest_version
             latest_version=$(curl -s https://raw.githubusercontent.com/cilium/cilium/master/stable.txt 2>/dev/null)
-            [ -z "$latest_version" ] && latest_version=$(curl -s https://api.github.com/repos/cilium/cilium/releases/latest 2>/dev/null | grep -oP '"tag_name":\s*"\K[^"]+')
+            [ -z "$latest_version" ] && latest_version=$(curl -s https://api.github.com/repos/cilium/cilium/releases/latest 2>/dev/null | github_release_tags | head -n 1)
             print_successful "Latest Stable Cilium Version: $latest_version"
         fi
     else
         print_error "Cilium CLI is not installed or not in PATH."
         local latest_version
         latest_version=$(curl -s https://raw.githubusercontent.com/cilium/cilium/master/stable.txt 2>/dev/null)
-        [ -z "$latest_version" ] && latest_version=$(curl -s https://api.github.com/repos/cilium/cilium/releases/latest 2>/dev/null | grep -oP '"tag_name":\s*"\K[^"]+')
+        [ -z "$latest_version" ] && latest_version=$(curl -s https://api.github.com/repos/cilium/cilium/releases/latest 2>/dev/null | github_release_tags | head -n 1)
         print_successful "Latest Stable Cilium Version: $latest_version"
     fi
 }
@@ -1289,7 +1337,7 @@ check_fluxcd_version() {
         fi
 
         local latest_version
-        latest_version=$(curl -s https://api.github.com/repos/fluxcd/flux2/releases/latest 2>/dev/null | grep -oP '"tag_name":\s*"\K[^"]+')
+        latest_version=$(curl -s https://api.github.com/repos/fluxcd/flux2/releases/latest 2>/dev/null | github_release_tags | head -n 1)
         [ -n "$latest_version" ] && print_info "Latest FluxCD Version: $latest_version"
     else
         print_info "FluxCD not detected in cluster."
@@ -1302,7 +1350,7 @@ list_available_versions() {
     # k0s versions
     print_info "Latest k0s Releases (Last 5):"
     curl -s https://api.github.com/repos/k0sproject/k0s/releases 2>/dev/null | \
-        grep -oP '"tag_name":\s*"\K[^"]+' | head -n 5 | \
+        github_release_tags | head -n 5 | \
         while read -r version; do echo "   $version"; done
     echo ""
 
@@ -1312,21 +1360,21 @@ list_available_versions() {
     echo ""
     print_info "Latest Cilium Releases (Last 5):"
     curl -s https://api.github.com/repos/cilium/cilium/releases 2>/dev/null | \
-        grep -oP '"tag_name":\s*"\K[^"]+' | head -n 5 | \
+        github_release_tags | head -n 5 | \
         while read -r version; do echo "   $version"; done
     echo ""
 
     # FluxCD versions
     print_info "Latest FluxCD Releases (Last 5):"
     curl -s https://api.github.com/repos/fluxcd/flux2/releases 2>/dev/null | \
-        grep -oP '"tag_name":\s*"\K[^"]+' | head -n 5 | \
+        github_release_tags | head -n 5 | \
         while read -r version; do echo "   $version"; done
     echo ""
 
     # Kairos versions
     print_info "Latest Kairos Releases (Last 5):"
     curl -s https://api.github.com/repos/kairos-io/kairos/releases 2>/dev/null | \
-        grep -oP '"tag_name":\s*"\K[^"]+' | head -n 5 | \
+        github_release_tags | head -n 5 | \
         while read -r version; do echo "   $version"; done
 
     echo -e "${YELLOW}===================================${NC}"
@@ -2100,38 +2148,41 @@ while true; do
     echo "2.  Generate Controller Cloud-Config (init)"
     echo "3.  Generate Controller Join Token + Cloud-Config (HA)"
     echo "4.  Generate Worker Token + Cloud-Config"
-    echo "5.  Generate Kairos Dockerfile (image build)"
-    echo "6.  Manage Cilium (install / upgrade / status)"
-    echo "7.  Manage FluxCD"
-    echo "8.  Manage BGP Configuration"
-    echo "9.  Check Versions"
-    echo "10. Check Cluster Status"
-    echo "11. Reset Node"
-    echo "12. Rolling OS Upgrade (A/B)"
-    echo "13. Show Config File"
-    echo "14. Setup SSH Keys"
-    echo "15. Kairos Web Installer (inject configs)"
-    echo "16. Exit"
+    echo "5.  Kairos Web Installer (inject configs)"
+    echo "6.  Generate Kairos Dockerfile (image build)"
+    echo "7.  Manage Cilium (install / upgrade / status)"
+    echo "8.  Manage FluxCD"
+    echo "9.  Manage BGP Configuration"
+    echo "10. Check Versions"
+    echo "11. Check Cluster Status"
+    echo "12. Reset Node"
+    echo "13. Rolling OS Upgrade (A/B)"
+    echo "14. Show Config File"
+    echo "15. Exit"
     echo -e "${YELLOW}=================================================${NC}"
-    read -p "Enter your choice: " choice
+    if ! read -p "Enter your choice: " choice; then
+        echo ""
+        print_info "Input closed. Exiting..."
+        exit 0
+    fi
 
     case $choice in
         1) generate_config_file ;;
         2) ensure_config && generate_controller_cloudconfig ;;
         3) ensure_config && generate_controller_token ;;
         4) ensure_config && generate_worker_token ;;
-        5) ensure_config && generate_kairos_dockerfile ;;
-        6) manage_cilium ;;
-        7) manage_flux ;;
-        8) manage_bgp ;;
-        9) check_versions ;;
-        10) check_cluster_status ;;
-        11) reset_node ;;
-        12) kairos_rolling_upgrade ;;
-        13) show_config_file ;;
-        14) setup_ssh_keys ;;
-        15) ensure_config && manage_web_installer ;;
-        16) echo "Exiting..."; exit 0 ;;
+        5) ensure_config && manage_web_installer ;;
+        6) ensure_config && generate_kairos_dockerfile ;;
+        7) manage_cilium ;;
+        8) manage_flux ;;
+        9) manage_bgp ;;
+        10) check_versions ;;
+        11) check_cluster_status ;;
+        12) reset_node ;;
+        13) kairos_rolling_upgrade ;;
+        14) show_config_file ;;
+        15) echo "Exiting..."; exit 0 ;;
+        "") continue ;;
         *) print_error "Invalid option." ;;
     esac
 done
