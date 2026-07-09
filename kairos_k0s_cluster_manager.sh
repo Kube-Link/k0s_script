@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.30"
+SCRIPT_VERSION="1.0.31"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -53,7 +53,7 @@ DEFAULT_SERVICE_CIDR="10.96.0.0/12"
 DEFAULT_CLUSTER_NAME="homelab"
 WORKER_INSTALL_STATE_FILE=".kairos_worker_installs_submitted"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Kube-Link/k0s_script/master/kairos_k0s_cluster_manager.sh"
-SAFE_SCRIPT_UPDATE_COMMAND="log=/var/log/kairos-cluster-manager-update.log; url=${SCRIPT_UPDATE_URL}; dest=/root/kairos-cluster-manager.sh; old=/root/kairos-cluster-manager.old.sh; tmp=/root/kairos-cluster-manager.sh.new; updated=n; rm -f \"\$tmp\"; for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do echo \"\$(date -Iseconds 2>/dev/null || date) attempt \$attempt\" >> \"\$log\"; if curl -fsSL --connect-timeout 10 --max-time 60 \"\$url\" -o \"\$tmp\" >> \"\$log\" 2>&1; then if head -n 1 \"\$tmp\" | tr -d '\r' | grep -qx '#!/bin/bash' && bash -n \"\$tmp\" >> \"\$log\" 2>&1; then new_version=\$(awk -F'\"' '/^SCRIPT_VERSION=/{print \$2; exit}' \"\$tmp\"); current_version=; if [ -f \"\$dest\" ]; then current_version=\$(awk -F'\"' '/^SCRIPT_VERSION=/{print \$2; exit}' \"\$dest\" 2>/dev/null); fi; if [ -n \"\$new_version\" ] && [ -n \"\$current_version\" ] && [ \"\$new_version\" = \"\$current_version\" ]; then echo \"\$(date -Iseconds 2>/dev/null || date) already current version \$current_version; no replace needed\" >> \"\$log\"; updated=y; rm -f \"\$tmp\"; break; fi; if [ -f \"\$dest\" ] && cmp -s \"\$tmp\" \"\$dest\"; then echo \"\$(date -Iseconds 2>/dev/null || date) already current; no replace needed\" >> \"\$log\"; updated=y; rm -f \"\$tmp\"; break; fi; if [ -f \"\$dest\" ]; then if cp -p \"\$dest\" \"\$old\"; then echo \"\$(date -Iseconds 2>/dev/null || date) backed up \$dest to \$old\" >> \"\$log\"; else echo \"\$(date -Iseconds 2>/dev/null || date) backup failed; keeping existing \$dest\" >> \"\$log\"; rm -f \"\$tmp\"; break; fi; fi; if mv \"\$tmp\" \"\$dest\" && chmod 0755 \"\$dest\"; then echo \"\$(date -Iseconds 2>/dev/null || date) updated \$dest; previous copy is \$old\" >> \"\$log\"; updated=y; break; else echo \"\$(date -Iseconds 2>/dev/null || date) install failed\" >> \"\$log\"; if [ -f \"\$old\" ] && [ ! -f \"\$dest\" ]; then cp -p \"\$old\" \"\$dest\" && chmod 0755 \"\$dest\"; fi; fi; else echo \"\$(date -Iseconds 2>/dev/null || date) downloaded file failed validation\" >> \"\$log\"; fi; else echo \"\$(date -Iseconds 2>/dev/null || date) download failed\" >> \"\$log\"; fi; sleep 10; done; if [ \"\$updated\" != \"y\" ]; then echo \"\$(date -Iseconds 2>/dev/null || date) keeping existing \$dest\" >> \"\$log\"; fi; rm -f \"\$tmp\""
+SAFE_SCRIPT_UPDATE_COMMAND="log=/var/log/kairos-cluster-manager-update.log; url=${SCRIPT_UPDATE_URL}; dest=/root/kairos-cluster-manager.sh; old=/root/kairos-cluster-manager.old.sh; tmp=/root/kairos-cluster-manager.sh.new; tmp_lf=/root/kairos-cluster-manager.sh.new.lf; updated=n; rm -f \"\$tmp\" \"\$tmp_lf\"; for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do echo \"\$(date -Iseconds 2>/dev/null || date) attempt \$attempt\" >> \"\$log\"; if curl -fsSL --connect-timeout 10 --max-time 60 \"\$url\" -o \"\$tmp\" >> \"\$log\" 2>&1; then tr -d '\r' < \"\$tmp\" > \"\$tmp_lf\" && mv \"\$tmp_lf\" \"\$tmp\"; if head -n 1 \"\$tmp\" | grep -qx '#!/bin/bash' && bash -n \"\$tmp\" >> \"\$log\" 2>&1; then new_version=\$(awk -F'\"' '/^SCRIPT_VERSION=/{print \$2; exit}' \"\$tmp\"); current_version=; if [ -f \"\$dest\" ]; then current_version=\$(tr -d '\r' < \"\$dest\" | awk -F'\"' '/^SCRIPT_VERSION=/{print \$2; exit}' 2>/dev/null); fi; cr=\$(printf '\r'); if [ -n \"\$new_version\" ] && [ -n \"\$current_version\" ] && [ \"\$new_version\" = \"\$current_version\" ]; then if [ -f \"\$dest\" ] && grep -q \"\$cr\" \"\$dest\"; then if mv \"\$tmp\" \"\$dest\" && chmod 0755 \"\$dest\"; then echo \"\$(date -Iseconds 2>/dev/null || date) normalized line endings for current version \$current_version\" >> \"\$log\"; updated=y; break; fi; else echo \"\$(date -Iseconds 2>/dev/null || date) already current version \$current_version; no replace needed\" >> \"\$log\"; updated=y; rm -f \"\$tmp\"; break; fi; fi; if [ -f \"\$dest\" ] && cmp -s \"\$tmp\" \"\$dest\"; then echo \"\$(date -Iseconds 2>/dev/null || date) already current; no replace needed\" >> \"\$log\"; updated=y; rm -f \"\$tmp\"; break; fi; if [ -f \"\$dest\" ]; then if cp -p \"\$dest\" \"\$old\"; then echo \"\$(date -Iseconds 2>/dev/null || date) backed up \$dest to \$old\" >> \"\$log\"; else echo \"\$(date -Iseconds 2>/dev/null || date) backup failed; keeping existing \$dest\" >> \"\$log\"; rm -f \"\$tmp\"; break; fi; fi; if mv \"\$tmp\" \"\$dest\" && chmod 0755 \"\$dest\"; then echo \"\$(date -Iseconds 2>/dev/null || date) updated \$dest; previous copy is \$old\" >> \"\$log\"; updated=y; break; else echo \"\$(date -Iseconds 2>/dev/null || date) install failed\" >> \"\$log\"; if [ -f \"\$old\" ] && [ ! -f \"\$dest\" ]; then cp -p \"\$old\" \"\$dest\" && chmod 0755 \"\$dest\"; fi; fi; else echo \"\$(date -Iseconds 2>/dev/null || date) downloaded file failed validation\" >> \"\$log\"; fi; else echo \"\$(date -Iseconds 2>/dev/null || date) download failed\" >> \"\$log\"; fi; sleep 10; done; if [ \"\$updated\" != \"y\" ]; then echo \"\$(date -Iseconds 2>/dev/null || date) keeping existing \$dest\" >> \"\$log\"; fi; rm -f \"\$tmp\" \"\$tmp_lf\""
 
 build_controller_k0s_args() {
     local include_token="${1:-false}"
@@ -67,6 +67,13 @@ build_controller_k0s_args() {
         printf '    - --enable-worker\n'
         printf '    - --no-taints\n'
     fi
+}
+
+script_base64_lf() {
+    local source_file="$1"
+
+    tr -d '\r' < "$source_file" | base64 -w0 2>/dev/null || \
+        tr -d '\r' < "$source_file" | base64 | tr -d '\n'
 }
 
 print_github_ssh_key_guide() {
@@ -519,7 +526,7 @@ config_url: \"${CONFIG_URL}\""
     K0S_ARGS=$(build_controller_k0s_args false)
 
     # Base64-encode script for compact embedding (avoids YAML indentation bloat)
-    local SCRIPT_B64=$(base64 -w0 "$0" 2>/dev/null || base64 "$0" | tr -d '\n')
+    local SCRIPT_B64=$(script_base64_lf "$0")
 
     cat > "$CONTROLLER_CC_FILE" << EOF
 #cloud-config
@@ -689,7 +696,7 @@ generate_worker_cloudconfig() {
     local USER_PASSWD=$(hash_password "kairos")
 
     # Base64-encode script for compact embedding
-    local SCRIPT_B64=$(base64 -w0 "$0" 2>/dev/null || base64 "$0" | tr -d '\n')
+    local SCRIPT_B64=$(script_base64_lf "$0")
 
     cat > "$OUTPUT_FILE" << EOF
 #cloud-config
@@ -927,7 +934,7 @@ generate_controller_join_cloudconfig() {
     local USER_PASSWD=$(hash_password "kairos")
 
     # Base64-encode script for compact embedding
-    local SCRIPT_B64=$(base64 -w0 "$0" 2>/dev/null || base64 "$0" | tr -d '\n')
+    local SCRIPT_B64=$(script_base64_lf "$0")
 
     cat > "$OUTPUT_FILE" << EOF
 #cloud-config
