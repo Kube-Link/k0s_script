@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.5"
+SCRIPT_VERSION="1.0.6"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -933,6 +933,15 @@ check_cluster_status() {
     else
         print_error "k0s not found on this node."
     fi
+
+    # Also show Cilium status if installed
+    echo ""
+    if command -v cilium &>/dev/null; then
+        print_info "Cilium status:"
+        cilium status 2>/dev/null || print_info "Cilium CLI found but unable to get status."
+    else
+        print_info "Cilium CLI not installed — run 'Manage Cilium' to install."
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -1680,7 +1689,8 @@ manage_cilium() {
     echo "1. Install Cilium"
     echo "2. Upgrade Cilium"
     echo "3. Check Cilium Version"
-    echo "4. Back to Main Menu"
+    echo "4. Check Cilium Status"
+    echo "5. Back to Main Menu"
     echo -e "${YELLOW}==================================${NC}"
     read -p "Enter your choice: " cilium_choice
 
@@ -1688,7 +1698,14 @@ manage_cilium() {
         1) ensure_config && install_cilium ;;
         2) upgrade_cilium ;;
         3) check_cilium_version ;;
-        4) return ;;
+        4)
+            if command -v cilium &>/dev/null; then
+                cilium status
+            else
+                print_error "Cilium CLI not installed."
+            fi
+            ;;
+        5) return ;;
         *) print_error "Invalid option. Returning to main menu." ;;
     esac
 }
