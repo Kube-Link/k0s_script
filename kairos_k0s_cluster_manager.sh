@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.17"
+SCRIPT_VERSION="1.0.18"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -2102,6 +2102,417 @@ manage_flux() {
 }
 
 # -----------------------------------------------------------------------------
+# Longhorn backup inventory and selective restore
+# -----------------------------------------------------------------------------
+longhorn_kubectl() {
+    if command -v k0s &>/dev/null; then
+        k0s kubectl "$@"
+    elif command -v kubectl &>/dev/null; then
+        KUBECONFIG="$K0S_KUBECONFIG" kubectl "$@"
+    else
+        print_error "kubectl/k0s not found. Cannot query the cluster."
+        return 1
+    fi
+}
+
+longhorn_require_cluster() {
+    if ! longhorn_kubectl get namespace longhorn-system &>/dev/null; then
+        print_error "longhorn-system namespace not found. Deploy Longhorn with Flux first."
+        return 1
+    fi
+
+    if ! longhorn_kubectl get crd backupvolumes.longhorn.io &>/dev/null; then
+        print_error "Longhorn BackupVolume CRD not found. Wait for Longhorn to finish installing."
+        return 1
+    fi
+
+    return 0
+}
+
+longhorn_json_field() {
+    local json="$1"
+    local field="$2"
+
+    printf '%s' "$json" | sed -n "s/.*\"${field}\":\"\([^\"]*\)\".*/\1/p"
+}
+
+longhorn_display_value() {
+    local value="$1"
+    if [ -n "$value" ] && [ "$value" != "<no value>" ]; then
+        printf '%s' "$value"
+    else
+        printf '-'
+    fi
+}
+
+sanitize_k8s_name() {
+    local value="$1"
+    value=$(printf '%s' "$value" | tr '[:upper:]_' '[:lower:]-')
+    value=$(printf '%s' "$value" | sed 's/[^a-z0-9.-]/-/g; s/^[^a-z0-9]*//; s/[^a-z0-9]*$//')
+    [ -n "$value" ] && printf '%s' "$value" || printf 'restored-volume'
+}
+
+bytes_to_k8s_quantity() {
+    local bytes="$1"
+    local gib=$((1024 * 1024 * 1024))
+
+    if [ -z "$bytes" ] || ! printf '%s' "$bytes" | grep -Eq '^[0-9]+$'; then
+        printf '1Gi'
+    elif [ $((bytes % gib)) -eq 0 ]; then
+        printf '%sGi' "$((bytes / gib))"
+    else
+        printf '%s' "$bytes"
+    fi
+}
+
+longhorn_backup_volume_lines() {
+    longhorn_kubectl get backupvolumes.longhorn.io -n longhorn-system -o go-template='{{range .items}}{{.metadata.name}}{{"\t"}}{{.spec.volumeName}}{{"\t"}}{{.status.lastBackupName}}{{"\t"}}{{.status.lastBackupAt}}{{"\t"}}{{.status.size}}{{"\t"}}{{.status.storageClassName}}{{"\t"}}{{with .status.labels}}{{index . "KubernetesStatus"}}{{end}}{{"\t"}}{{with .status.labels}}{{index . "longhorn.io/volume-access-mode"}}{{end}}{{"\n"}}{{end}}'
+}
+
+longhorn_list_backup_inventory() {
+    longhorn_require_cluster || return 1
+
+    print_info "Longhorn backup target:"
+    longhorn_kubectl get backuptargets.longhorn.io -n longhorn-system 2>/dev/null || \
+        print_warning "BackupTarget CR not found or not ready yet."
+    echo ""
+
+    print_info "Latest backup per Longhorn backup volume:"
+    local lines=()
+    mapfile -t lines < <(longhorn_backup_volume_lines 2>/dev/null)
+
+    if [ "${#lines[@]}" -eq 0 ]; then
+        print_warning "No Longhorn backup volumes found. Confirm the backup target is configured and synced."
+        return 0
+    fi
+
+    printf '%-4s %-24s %-34s %-22s %-20s %-8s %s\n' "NO" "NAMESPACE" "PVC" "LAST_BACKUP" "LAST_BACKUP_AT" "ACCESS" "SOURCE_VOLUME"
+    local index=1
+    local line backup_volume source_volume last_backup last_backup_at size_bytes storage_class kstatus access_mode
+    local namespace pvc
+    for line in "${lines[@]}"; do
+        IFS=$'\t' read -r backup_volume source_volume last_backup last_backup_at size_bytes storage_class kstatus access_mode <<< "$line"
+        [ -z "$last_backup" ] && continue
+        namespace=$(longhorn_json_field "$kstatus" "namespace")
+        pvc=$(longhorn_json_field "$kstatus" "pvcName")
+        printf '%-4s %-24s %-34s %-22s %-20s %-8s %s\n' \
+            "$index" \
+            "$(longhorn_display_value "$namespace")" \
+            "$(longhorn_display_value "$pvc")" \
+            "$last_backup" \
+            "$(longhorn_display_value "$last_backup_at")" \
+            "$(longhorn_display_value "$access_mode")" \
+            "$source_volume"
+        index=$((index + 1))
+    done
+}
+
+longhorn_restore_status() {
+    longhorn_require_cluster || return 1
+
+    print_info "Longhorn volumes and restore state:"
+    longhorn_kubectl get volumes.longhorn.io -n longhorn-system \
+        -o custom-columns=VOLUME:.metadata.name,STATE:.status.state,ROBUSTNESS:.status.robustness,RESTORE_REQUIRED:.status.restoreRequired,SIZE:.spec.size,FROM_BACKUP:.spec.fromBackup
+}
+
+longhorn_wait_for_restore() {
+    local volume_name="$1"
+    local timeout_seconds="${2:-1800}"
+    local deadline=$((SECONDS + timeout_seconds))
+
+    print_info "Waiting for Longhorn restore to complete for volume: $volume_name"
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        local restore_required state robustness
+        restore_required=$(longhorn_kubectl get volumes.longhorn.io "$volume_name" -n longhorn-system -o jsonpath='{.status.restoreRequired}' 2>/dev/null)
+        state=$(longhorn_kubectl get volumes.longhorn.io "$volume_name" -n longhorn-system -o jsonpath='{.status.state}' 2>/dev/null)
+        robustness=$(longhorn_kubectl get volumes.longhorn.io "$volume_name" -n longhorn-system -o jsonpath='{.status.robustness}' 2>/dev/null)
+
+        printf '  volume=%s state=%s robustness=%s restoreRequired=%s\n' \
+            "$volume_name" \
+            "$(longhorn_display_value "$state")" \
+            "$(longhorn_display_value "$robustness")" \
+            "$(longhorn_display_value "$restore_required")"
+
+        if [ "$restore_required" = "false" ]; then
+            print_successful "Restore completed for $volume_name."
+            return 0
+        fi
+
+        sleep 10
+    done
+
+    print_warning "Timed out waiting for restore. You can check again from the Longhorn menu."
+    return 1
+}
+
+longhorn_selective_restore() {
+    longhorn_require_cluster || return 1
+
+    local lines=()
+    mapfile -t lines < <(longhorn_backup_volume_lines 2>/dev/null)
+    if [ "${#lines[@]}" -eq 0 ]; then
+        print_warning "No Longhorn backup volumes found. Confirm the backup target is configured and synced."
+        return 0
+    fi
+
+    local backup_volumes=()
+    local source_volumes=()
+    local last_backups=()
+    local last_backup_ats=()
+    local size_bytes_values=()
+    local storage_classes=()
+    local namespaces=()
+    local pvcs=()
+    local pods=()
+    local workloads=()
+    local access_modes=()
+
+    printf '%-4s %-24s %-34s %-22s %-20s %-8s %s\n' "NO" "NAMESPACE" "PVC" "LAST_BACKUP" "LAST_BACKUP_AT" "ACCESS" "SOURCE_VOLUME"
+    local index=1
+    local line backup_volume source_volume last_backup last_backup_at size_bytes storage_class kstatus access_mode
+    local namespace pvc pod workload
+    for line in "${lines[@]}"; do
+        IFS=$'\t' read -r backup_volume source_volume last_backup last_backup_at size_bytes storage_class kstatus access_mode <<< "$line"
+        [ -z "$last_backup" ] && continue
+
+        namespace=$(longhorn_json_field "$kstatus" "namespace")
+        pvc=$(longhorn_json_field "$kstatus" "pvcName")
+        pod=$(longhorn_json_field "$kstatus" "podName")
+        workload=$(longhorn_json_field "$kstatus" "workloadName")
+        access_mode=${access_mode:-rwo}
+        storage_class=${storage_class:-longhorn}
+
+        backup_volumes+=("$backup_volume")
+        source_volumes+=("$source_volume")
+        last_backups+=("$last_backup")
+        last_backup_ats+=("$last_backup_at")
+        size_bytes_values+=("$size_bytes")
+        storage_classes+=("$storage_class")
+        namespaces+=("$namespace")
+        pvcs+=("$pvc")
+        pods+=("$pod")
+        workloads+=("$workload")
+        access_modes+=("$access_mode")
+
+        printf '%-4s %-24s %-34s %-22s %-20s %-8s %s\n' \
+            "$index" \
+            "$(longhorn_display_value "$namespace")" \
+            "$(longhorn_display_value "$pvc")" \
+            "$last_backup" \
+            "$(longhorn_display_value "$last_backup_at")" \
+            "$(longhorn_display_value "$access_mode")" \
+            "$source_volume"
+        index=$((index + 1))
+    done
+
+    if [ "${#last_backups[@]}" -eq 0 ]; then
+        print_warning "Backup volumes exist, but none have a latest backup recorded yet."
+        return 0
+    fi
+
+    echo ""
+    read -p "Select backup volume number to restore: " selection
+    if ! printf '%s' "$selection" | grep -Eq '^[0-9]+$' || [ "$selection" -lt 1 ] || [ "$selection" -gt "${#last_backups[@]}" ]; then
+        print_error "Invalid selection."
+        return 1
+    fi
+
+    local selected=$((selection - 1))
+    local selected_backup="${last_backups[$selected]}"
+    local selected_source="${source_volumes[$selected]}"
+    local selected_namespace="${namespaces[$selected]}"
+    local selected_pvc="${pvcs[$selected]}"
+    local selected_pod="${pods[$selected]}"
+    local selected_workload="${workloads[$selected]}"
+    local selected_access_mode="${access_modes[$selected]}"
+    local selected_storage_class="${storage_classes[$selected]}"
+
+    print_info "Selected backup:"
+    echo "  Backup:        $selected_backup"
+    echo "  Source volume: $selected_source"
+    echo "  Namespace:     $(longhorn_display_value "$selected_namespace")"
+    echo "  PVC:           $(longhorn_display_value "$selected_pvc")"
+    echo "  Workload:      $(longhorn_display_value "$selected_workload")"
+    echo "  Pod:           $(longhorn_display_value "$selected_pod")"
+    echo "  Access mode:   $selected_access_mode"
+    echo ""
+
+    local backup_url volume_size
+    backup_url=$(longhorn_kubectl get backups.longhorn.io "$selected_backup" -n longhorn-system -o jsonpath='{.status.url}' 2>/dev/null)
+    volume_size=$(longhorn_kubectl get backups.longhorn.io "$selected_backup" -n longhorn-system -o jsonpath='{.status.volumeSize}' 2>/dev/null)
+    if [ -z "$backup_url" ] || [ -z "$volume_size" ]; then
+        print_error "Could not read backup URL/size from Backup CR: $selected_backup"
+        print_info "Check that the new cluster has synced all backups from the backup target."
+        return 1
+    fi
+
+    local default_volume_name
+    if [ -n "$selected_namespace" ] && [ -n "$selected_pvc" ]; then
+        default_volume_name=$(sanitize_k8s_name "${selected_namespace}-${selected_pvc}")
+    else
+        default_volume_name=$(sanitize_k8s_name "${selected_source}-restore")
+    fi
+
+    local restore_volume_name target_namespace target_pvc storage_class replicas pv_name access_mode_k8s storage_quantity
+    read -p "Restored Longhorn volume name (default: ${default_volume_name}): " restore_volume_name
+    restore_volume_name=${restore_volume_name:-$default_volume_name}
+    restore_volume_name=$(sanitize_k8s_name "$restore_volume_name")
+
+    read -p "Target PVC namespace (default: ${selected_namespace:-default}): " target_namespace
+    target_namespace=${target_namespace:-${selected_namespace:-default}}
+    target_namespace=$(sanitize_k8s_name "$target_namespace")
+
+    read -p "Target PVC name (default: ${selected_pvc:-${restore_volume_name}-pvc}): " target_pvc
+    target_pvc=${target_pvc:-${selected_pvc:-${restore_volume_name}-pvc}}
+    target_pvc=$(sanitize_k8s_name "$target_pvc")
+
+    read -p "StorageClass name (default: ${selected_storage_class:-longhorn}): " storage_class
+    storage_class=${storage_class:-${selected_storage_class:-longhorn}}
+
+    read -p "Longhorn replica count (default: 3): " replicas
+    replicas=${replicas:-3}
+    if ! printf '%s' "$replicas" | grep -Eq '^[0-9]+$' || [ "$replicas" -lt 1 ]; then
+        print_error "Replica count must be a positive integer."
+        return 1
+    fi
+
+    pv_name="$restore_volume_name"
+    storage_quantity=$(bytes_to_k8s_quantity "$volume_size")
+    if [ "$selected_access_mode" = "rwx" ]; then
+        access_mode_k8s="ReadWriteMany"
+    else
+        access_mode_k8s="ReadWriteOnce"
+        selected_access_mode="rwo"
+    fi
+
+    local file_prefix restore_manifest bind_manifest
+    file_prefix=$(sanitize_k8s_name "${target_namespace}-${target_pvc}-${selected_backup}")
+    restore_manifest="./longhorn-restore-${file_prefix}.yaml"
+    bind_manifest="./longhorn-bind-${file_prefix}.yaml"
+
+    cat > "$restore_manifest" << EOF
+apiVersion: longhorn.io/v1beta2
+kind: Volume
+metadata:
+  name: ${restore_volume_name}
+  namespace: longhorn-system
+spec:
+  size: "${volume_size}"
+  fromBackup: "${backup_url}"
+  numberOfReplicas: ${replicas}
+  frontend: blockdev
+  dataEngine: v1
+  accessMode: ${selected_access_mode}
+EOF
+
+    cat > "$bind_manifest" << EOF
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ${pv_name}
+spec:
+  capacity:
+    storage: ${storage_quantity}
+  volumeMode: Filesystem
+  accessModes:
+    - ${access_mode_k8s}
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ${storage_class}
+  csi:
+    driver: driver.longhorn.io
+    fsType: ext4
+    volumeAttributes:
+      numberOfReplicas: "${replicas}"
+      staleReplicaTimeout: "30"
+    volumeHandle: ${restore_volume_name}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ${target_pvc}
+  namespace: ${target_namespace}
+spec:
+  accessModes:
+    - ${access_mode_k8s}
+  storageClassName: ${storage_class}
+  volumeName: ${pv_name}
+  resources:
+    requests:
+      storage: ${storage_quantity}
+EOF
+
+    print_successful "Generated restore manifest: $restore_manifest"
+    print_successful "Generated PV/PVC bind manifest: $bind_manifest"
+    print_warning "Keep the application stopped until Longhorn restoreRequired=false."
+    echo ""
+
+    read -p "Apply the Longhorn Volume restore manifest now? Type RESTORE to continue: " confirm_restore
+    if [ "$confirm_restore" != "RESTORE" ]; then
+        print_info "Restore not applied. You can apply later with:"
+        echo "  kubectl apply -f $restore_manifest"
+        return 0
+    fi
+
+    longhorn_kubectl apply -f "$restore_manifest" || return 1
+    print_successful "Restore requested for Longhorn volume: $restore_volume_name"
+    echo ""
+
+    read -p "Wait for restore and apply PV/PVC binding now? (y/n): " bind_now
+    if [ "$bind_now" != "y" ]; then
+        print_info "Check restore later with:"
+        echo "  kubectl -n longhorn-system get volumes.longhorn.io $restore_volume_name -o jsonpath='{.status.restoreRequired}'"
+        print_info "After restoreRequired=false, apply:"
+        echo "  kubectl apply -f $bind_manifest"
+        return 0
+    fi
+
+    longhorn_wait_for_restore "$restore_volume_name" 1800 || return 1
+
+    if ! longhorn_kubectl get namespace "$target_namespace" &>/dev/null; then
+        print_warning "Namespace $target_namespace does not exist."
+        read -p "Create namespace $target_namespace now? (y/n): " create_namespace
+        if [ "$create_namespace" = "y" ]; then
+            longhorn_kubectl create namespace "$target_namespace" || return 1
+        else
+            print_info "Apply the bind manifest after the namespace exists:"
+            echo "  kubectl apply -f $bind_manifest"
+            return 0
+        fi
+    fi
+
+    longhorn_kubectl apply -f "$bind_manifest" || return 1
+    print_successful "PV/PVC binding applied."
+    print_info "Start or reconcile the application only after the PVC is Bound:"
+    echo "  kubectl -n $target_namespace get pvc $target_pvc"
+}
+
+manage_longhorn() {
+    while true; do
+        echo -e "${YELLOW}======== Longhorn Backup / Restore ========${NC}"
+        echo "1. Check Longhorn backup target"
+        echo "2. List backup inventory"
+        echo "3. Selective restore latest backup"
+        echo "4. Check restore / volume status"
+        echo "5. Back to Main Menu"
+        echo -e "${YELLOW}==========================================${NC}"
+        read -p "Enter your choice: " longhorn_choice
+
+        case $longhorn_choice in
+            1)
+                longhorn_require_cluster || continue
+                longhorn_kubectl get backuptargets.longhorn.io -n longhorn-system
+                ;;
+            2) longhorn_list_backup_inventory ;;
+            3) longhorn_selective_restore ;;
+            4) longhorn_restore_status ;;
+            5) return ;;
+            "") continue ;;
+            *) print_error "Invalid option." ;;
+        esac
+    done
+}
+
+# -----------------------------------------------------------------------------
 # SSH key setup — finds or generates a key, saves public key to config for
 # cloud-config injection (no ssh-copy-id needed — Kairos is immutable)
 # -----------------------------------------------------------------------------
@@ -2207,13 +2618,14 @@ while true; do
     echo "6.  Generate Kairos Dockerfile (image build)"
     echo "7.  Manage Cilium (install / upgrade / status)"
     echo "8.  Manage FluxCD"
-    echo "9.  Manage BGP Configuration"
-    echo "10. Check Versions"
-    echo "11. Check Cluster Status"
-    echo "12. Reset Node"
-    echo "13. Rolling OS Upgrade (A/B)"
-    echo "14. Show Config File"
-    echo "15. Exit"
+    echo "9.  Manage Longhorn Backups / Restore"
+    echo "10. Manage BGP Configuration"
+    echo "11. Check Versions"
+    echo "12. Check Cluster Status"
+    echo "13. Reset Node"
+    echo "14. Rolling OS Upgrade (A/B)"
+    echo "15. Show Config File"
+    echo "16. Exit"
     echo -e "${YELLOW}=================================================${NC}"
     if ! read -p "Enter your choice: " choice; then
         echo ""
@@ -2230,13 +2642,14 @@ while true; do
         6) ensure_config && generate_kairos_dockerfile ;;
         7) manage_cilium ;;
         8) manage_flux ;;
-        9) manage_bgp ;;
-        10) check_versions ;;
-        11) check_cluster_status ;;
-        12) reset_node ;;
-        13) kairos_rolling_upgrade ;;
-        14) show_config_file ;;
-        15) echo "Exiting..."; exit 0 ;;
+        9) manage_longhorn ;;
+        10) manage_bgp ;;
+        11) check_versions ;;
+        12) check_cluster_status ;;
+        13) reset_node ;;
+        14) kairos_rolling_upgrade ;;
+        15) show_config_file ;;
+        16) echo "Exiting..."; exit 0 ;;
         "") continue ;;
         *) print_error "Invalid option." ;;
     esac
