@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.22"
+SCRIPT_VERSION="1.0.24"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -409,7 +409,6 @@ BUNDLEEOF
 
     print_successful "Controller cloud-config written to $CONTROLLER_CC_FILE"
     print_info "Next: use main menu option 5 -> 1 to send this config to the primary controller installer."
-    print_info "Validate with: docker run -ti -v \"\$PWD\":/test --entrypoint /usr/bin/kairos-agent --rm quay.io/kairos/hadron:v0.4.0-core-amd64-generic-${KAIROS_IMAGE_VERSION} validate /test/${CONTROLLER_CC_FILE}"
 }
 
 # Generates the worker cloud-config. Requires a token from the controller.
@@ -553,7 +552,6 @@ BUNDLEEOF
     fi
 
     print_successful "Worker cloud-config written to ${OUTPUT_FILE}"
-    print_info "Validate with: docker run -ti -v \"\$PWD\":/test --entrypoint /usr/bin/kairos-agent --rm quay.io/kairos/hadron:v0.4.0-core-amd64-generic-${KAIROS_IMAGE_VERSION} validate /test/${OUTPUT_FILE}"
 }
 
 # Produces one cloud-config per worker: worker-cloud-config-<index>.yaml
@@ -819,7 +817,6 @@ BUNDLEEOF
 
     print_successful "Controller join cloud-config written to ${OUTPUT_FILE}"
     print_info "Installer target: http://${NODE_IP}:8080"
-    print_info "Validate with: docker run -ti -v \"\$PWD\":/test --entrypoint /usr/bin/kairos-agent --rm quay.io/kairos/hadron:v0.4.0-core-amd64-generic-${KAIROS_IMAGE_VERSION} validate /test/${OUTPUT_FILE}"
 }
 
 # -----------------------------------------------------------------------------
