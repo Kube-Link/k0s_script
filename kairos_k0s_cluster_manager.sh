@@ -45,13 +45,15 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.24"
+SCRIPT_VERSION="1.0.26"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
 DEFAULT_SERVICE_CIDR="10.96.0.0/12"
 DEFAULT_CLUSTER_NAME="homelab"
 WORKER_INSTALL_STATE_FILE=".kairos_worker_installs_submitted"
+SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Kube-Link/k0s_script/master/kairos_k0s_cluster_manager.sh"
+SAFE_SCRIPT_UPDATE_COMMAND="log=/var/log/kairos-cluster-manager-update.log; url=${SCRIPT_UPDATE_URL}; dest=/root/kairos-cluster-manager.sh; tmp=/root/kairos-cluster-manager.sh.new; updated=n; rm -f \"\$tmp\"; for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do echo \"\$(date -Iseconds 2>/dev/null || date) attempt \$attempt\" >> \"\$log\"; if curl -fsSL --connect-timeout 10 --max-time 60 \"\$url\" -o \"\$tmp\" >> \"\$log\" 2>&1; then if head -n 1 \"\$tmp\" | tr -d '\r' | grep -qx '#!/bin/bash' && bash -n \"\$tmp\" >> \"\$log\" 2>&1; then if cp \"\$tmp\" \"\$dest\" && chmod 0755 \"\$dest\"; then echo \"\$(date -Iseconds 2>/dev/null || date) updated \$dest\" >> \"\$log\"; updated=y; break; fi; echo \"\$(date -Iseconds 2>/dev/null || date) install failed\" >> \"\$log\"; fi; echo \"\$(date -Iseconds 2>/dev/null || date) downloaded file failed validation\" >> \"\$log\"; else echo \"\$(date -Iseconds 2>/dev/null || date) download failed\" >> \"\$log\"; fi; sleep 10; done; if [ \"\$updated\" != \"y\" ]; then echo \"\$(date -Iseconds 2>/dev/null || date) keeping existing \$dest\" >> \"\$log\"; fi; rm -f \"\$tmp\""
 
 build_controller_k0s_args() {
     local include_token="${1:-false}"
@@ -371,9 +373,9 @@ bind_mounts:
 
 stages:
   boot:
-    - name: "Update cluster manager script if remote copy is valid"
+    - name: "Update cluster manager script safely"
       commands:
-        - tmp=/root/kairos-cluster-manager.sh.new; if curl -fsSL --retry 3 --connect-timeout 10 https://raw.githubusercontent.com/Kube-Link/k0s_script/master/kairos_k0s_cluster_manager.sh -o "$tmp" && head -n 1 "$tmp" | grep -q '^#!/bin/bash' && bash -n "$tmp"; then mv "$tmp" /root/kairos-cluster-manager.sh && chmod +x /root/kairos-cluster-manager.sh; else echo "Skipping cluster manager update; remote download was invalid"; rm -f "$tmp"; fi
+        - ${SAFE_SCRIPT_UPDATE_COMMAND}
 # Longhorn requirement
   boot.after:
     - name: "Enable iSCSI"
@@ -516,9 +518,9 @@ bind_mounts:
 
 stages:
   boot:
-    - name: "Update cluster manager script if remote copy is valid"
+    - name: "Update cluster manager script safely"
       commands:
-        - tmp=/root/kairos-cluster-manager.sh.new; if curl -fsSL --retry 3 --connect-timeout 10 https://raw.githubusercontent.com/Kube-Link/k0s_script/master/kairos_k0s_cluster_manager.sh -o "$tmp" && head -n 1 "$tmp" | grep -q '^#!/bin/bash' && bash -n "$tmp"; then mv "$tmp" /root/kairos-cluster-manager.sh && chmod +x /root/kairos-cluster-manager.sh; else echo "Skipping cluster manager update; remote download was invalid"; rm -f "$tmp"; fi
+        - ${SAFE_SCRIPT_UPDATE_COMMAND}
   boot.after:
     - name: "Enable iSCSI"
       commands:
@@ -783,9 +785,9 @@ bind_mounts:
 
 stages:
   boot:
-    - name: "Update cluster manager script if remote copy is valid"
+    - name: "Update cluster manager script safely"
       commands:
-        - tmp=/root/kairos-cluster-manager.sh.new; if curl -fsSL --retry 3 --connect-timeout 10 https://raw.githubusercontent.com/Kube-Link/k0s_script/master/kairos_k0s_cluster_manager.sh -o "$tmp" && head -n 1 "$tmp" | grep -q '^#!/bin/bash' && bash -n "$tmp"; then mv "$tmp" /root/kairos-cluster-manager.sh && chmod +x /root/kairos-cluster-manager.sh; else echo "Skipping cluster manager update; remote download was invalid"; rm -f "$tmp"; fi
+        - ${SAFE_SCRIPT_UPDATE_COMMAND}
   boot.after:
     - name: "Enable iSCSI"
       commands:
