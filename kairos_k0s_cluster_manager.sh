@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.33"
+SCRIPT_VERSION="1.0.34"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -1663,6 +1663,143 @@ version_tags_equal() {
     [ "$left" = "$right" ] || [ "${left#v}" = "${right#v}" ]
 }
 
+semver_numeric_part() {
+    local value="$1"
+
+    value="${value%%[^0-9]*}"
+    [ -n "$value" ] || value=0
+    printf '%d\n' "$((10#$value))"
+}
+
+semver_compare_identifiers() {
+    local left="$1"
+    local right="$2"
+    local left_id
+    local right_id
+    local left_num
+    local right_num
+
+    while true; do
+        if [ -z "$left" ] && [ -z "$right" ]; then
+            echo 0
+            return 0
+        elif [ -z "$left" ]; then
+            echo -1
+            return 0
+        elif [ -z "$right" ]; then
+            echo 1
+            return 0
+        fi
+
+        left_id="${left%%.*}"
+        right_id="${right%%.*}"
+        [ "$left_id" = "$left" ] && left="" || left="${left#*.}"
+        [ "$right_id" = "$right" ] && right="" || right="${right#*.}"
+
+        if [[ "$left_id" =~ ^[0-9]+$ ]] && [[ "$right_id" =~ ^[0-9]+$ ]]; then
+            left_num=$((10#$left_id))
+            right_num=$((10#$right_id))
+            if [ "$left_num" -gt "$right_num" ]; then
+                echo 1
+                return 0
+            elif [ "$left_num" -lt "$right_num" ]; then
+                echo -1
+                return 0
+            fi
+        elif [[ "$left_id" =~ ^[0-9]+$ ]]; then
+            echo -1
+            return 0
+        elif [[ "$right_id" =~ ^[0-9]+$ ]]; then
+            echo 1
+            return 0
+        elif [[ "$left_id" > "$right_id" ]]; then
+            echo 1
+            return 0
+        elif [[ "$left_id" < "$right_id" ]]; then
+            echo -1
+            return 0
+        fi
+    done
+}
+
+semver_compare() {
+    local left_raw="${1#v}"
+    local right_raw="${2#v}"
+    local left_build=""
+    local right_build=""
+    local left_version
+    local right_version
+    local left_core
+    local right_core
+    local left_pre=""
+    local right_pre=""
+    local left_major
+    local left_minor
+    local left_patch
+    local right_major
+    local right_minor
+    local right_patch
+    local left_value
+    local right_value
+    local result
+
+    [[ "$left_raw" == *+* ]] && left_build="${left_raw#*+}"
+    [[ "$right_raw" == *+* ]] && right_build="${right_raw#*+}"
+    left_version="${left_raw%%+*}"
+    right_version="${right_raw%%+*}"
+
+    left_core="${left_version%%-*}"
+    right_core="${right_version%%-*}"
+    [[ "$left_version" == *-* ]] && left_pre="${left_version#*-}"
+    [[ "$right_version" == *-* ]] && right_pre="${right_version#*-}"
+
+    IFS=. read -r left_major left_minor left_patch _ <<< "$left_core"
+    IFS=. read -r right_major right_minor right_patch _ <<< "$right_core"
+
+    for part in major minor patch; do
+        case "$part" in
+            major)
+                left_value=$(semver_numeric_part "$left_major")
+                right_value=$(semver_numeric_part "$right_major")
+                ;;
+            minor)
+                left_value=$(semver_numeric_part "$left_minor")
+                right_value=$(semver_numeric_part "$right_minor")
+                ;;
+            patch)
+                left_value=$(semver_numeric_part "$left_patch")
+                right_value=$(semver_numeric_part "$right_patch")
+                ;;
+        esac
+
+        if [ "$left_value" -gt "$right_value" ]; then
+            echo 1
+            return 0
+        elif [ "$left_value" -lt "$right_value" ]; then
+            echo -1
+            return 0
+        fi
+    done
+
+    if [ -z "$left_pre" ] && [ -n "$right_pre" ]; then
+        echo 1
+        return 0
+    elif [ -n "$left_pre" ] && [ -z "$right_pre" ]; then
+        echo -1
+        return 0
+    elif [ -n "$left_pre" ] || [ -n "$right_pre" ]; then
+        result=$(semver_compare_identifiers "$left_pre" "$right_pre")
+        [ "$result" != "0" ] && { echo "$result"; return 0; }
+    fi
+
+    if [ -n "$left_build" ] && [ -n "$right_build" ]; then
+        result=$(semver_compare_identifiers "$left_build" "$right_build")
+        [ "$result" != "0" ] && { echo "$result"; return 0; }
+    fi
+
+    echo 0
+}
+
 fetch_github_release_tags() {
     local repo="$1"
 
@@ -1692,9 +1829,10 @@ print_release_context() {
     local releases
     local latest_version
     local version
-    local found="n"
-    local -a newer_versions=()
-    local -a previous_versions=()
+    local compare_result
+    local nearest_newer=""
+    local previous_one=""
+    local previous_two=""
 
     releases=$(fetch_github_release_tags "$repo")
     if [ -z "$releases" ]; then
@@ -1702,9 +1840,14 @@ print_release_context() {
         return 0
     fi
 
-    latest_version=$(printf '%s\n' "$releases" | head -n 1)
-    [ -n "$latest_version" ] && print_successful "Latest available ${label}: $latest_version"
+    while IFS= read -r version; do
+        [ -z "$version" ] && continue
+        if [ -z "$latest_version" ] || [ "$(semver_compare "$version" "$latest_version")" -gt 0 ]; then
+            latest_version="$version"
+        fi
+    done <<< "$releases"
 
+    [ -n "$latest_version" ] && print_successful "Latest available ${label}: $latest_version"
     if [ -z "$current_version" ]; then
         print_info "Latest ${label} releases (last 5):"
         print_release_lines "$releases" 5
@@ -1713,39 +1856,37 @@ print_release_context() {
 
     while IFS= read -r version; do
         [ -z "$version" ] && continue
+        compare_result=$(semver_compare "$version" "$current_version")
 
-        if [ "$found" = "n" ]; then
-            if version_tags_equal "$version" "$current_version"; then
-                found="y"
-                continue
+        if [ "$compare_result" -gt 0 ]; then
+            if [ -z "$nearest_newer" ] || [ "$(semver_compare "$version" "$nearest_newer")" -lt 0 ]; then
+                nearest_newer="$version"
             fi
-            [ "${#newer_versions[@]}" -lt 5 ] && newer_versions+=("$version")
-        else
-            [ "${#previous_versions[@]}" -lt 5 ] && previous_versions+=("$version")
+        elif [ "$compare_result" -lt 0 ]; then
+            if [ -z "$previous_one" ] || [ "$(semver_compare "$version" "$previous_one")" -gt 0 ]; then
+                if [ -n "$previous_one" ] && ! version_tags_equal "$version" "$previous_one"; then
+                    previous_two="$previous_one"
+                fi
+                previous_one="$version"
+            elif ! version_tags_equal "$version" "$previous_one" && { [ -z "$previous_two" ] || [ "$(semver_compare "$version" "$previous_two")" -gt 0 ]; }; then
+                previous_two="$version"
+            fi
         fi
-
-        [ "$found" = "y" ] && [ "${#previous_versions[@]}" -ge 5 ] && break
     done <<< "$releases"
 
-    if [ "$found" != "y" ]; then
-        print_warning "Running ${label} version was not found in the latest GitHub release window."
-        print_info "Latest ${label} releases (last 5):"
-        print_release_lines "$releases" 5
-        return 0
-    fi
-
-    print_info "Newer ${label} releases:"
-    if [ "${#newer_versions[@]}" -eq 0 ]; then
+    print_info "Newer ${label} release:"
+    if [ -z "$nearest_newer" ]; then
         echo "   none detected"
     else
-        printf '   %s\n' "${newer_versions[@]}"
+        echo "   $nearest_newer"
     fi
 
     print_info "Previous ${label} releases:"
-    if [ "${#previous_versions[@]}" -eq 0 ]; then
+    if [ -z "$previous_one" ]; then
         echo "   none detected"
     else
-        printf '   %s\n' "${previous_versions[@]}"
+        echo "   $previous_one"
+        [ -n "$previous_two" ] && echo "   $previous_two"
     fi
 }
 
