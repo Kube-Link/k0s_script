@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.34"
+SCRIPT_VERSION="1.0.35"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -1802,8 +1802,17 @@ semver_compare() {
 
 fetch_github_release_tags() {
     local repo="$1"
+    local tags
 
-    curl -s --connect-timeout 5 --max-time 15 "https://api.github.com/repos/${repo}/releases?per_page=100" 2>/dev/null | github_release_tags
+    if [ "$repo" = "kairos-io/kairos" ]; then
+        tags=$(curl -s --connect-timeout 5 --max-time 15 "https://api.github.com/repos/${repo}/tags?per_page=100" 2>/dev/null | github_tag_names)
+        [ -n "$tags" ] && { printf '%s\n' "$tags"; return 0; }
+    fi
+
+    tags=$(curl -s --connect-timeout 5 --max-time 15 "https://api.github.com/repos/${repo}/releases?per_page=30" 2>/dev/null | github_release_tags)
+    [ -n "$tags" ] && { printf '%s\n' "$tags"; return 0; }
+
+    curl -s --connect-timeout 5 --max-time 15 "https://api.github.com/repos/${repo}/tags?per_page=100" 2>/dev/null | github_tag_names
 }
 
 print_release_lines() {
@@ -2073,7 +2082,11 @@ check_cluster_status() {
 }
 
 github_release_tags() {
-    sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p'
+    tr '{,' '\n' | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | sed -n '/^v[0-9]/p'
+}
+
+github_tag_names() {
+    tr '{,' '\n' | sed -n 's/.*"name":[[:space:]]*"\([^"]*\)".*/\1/p' | sed -n '/^v[0-9]/p'
 }
 
 # -----------------------------------------------------------------------------
