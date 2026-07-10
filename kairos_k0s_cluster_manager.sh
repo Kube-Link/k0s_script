@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.35"
+SCRIPT_VERSION="1.0.38"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -580,6 +580,21 @@ write_files:
         scheduler: {}
         telemetry:
           enabled: false
+  - path: /usr/local/bin/kubectl
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      exec k0s kubectl "\$@"
+  - path: /etc/profile.d/k0s-kubeconfig.sh
+    permissions: "0644"
+    content: |
+      export KUBECONFIG=${K0S_KUBECONFIG}
+      alias k=kubectl
+      if [ -n "\${BASH_VERSION:-}" ]; then
+        for completion in /etc/bash_completion.d/k0s /etc/bash_completion.d/kubectl /etc/bash_completion.d/kubectl-alias; do
+          [ -r "\$completion" ] && . "\$completion"
+        done
+      fi
   - path: /root/kairos-cluster-manager.sh
     permissions: "0755"
     encoding: b64
@@ -621,6 +636,13 @@ stages:
       if: "[ ! -d /var/lib/k0s/kubelet ]"
       commands:
         - mkdir -p /var/lib/k0s/kubelet
+    - name: "Configure controller shell defaults"
+      commands:
+        - mkdir -p /etc/profile.d /etc/bash_completion.d /usr/local/bin
+        - chmod 0755 /usr/local/bin/kubectl
+        - k0s completion bash > /etc/bash_completion.d/k0s 2>/dev/null || true
+        - kubectl completion bash > /etc/bash_completion.d/kubectl 2>/dev/null || true
+        - printf "%s\n" "complete -o default -F __start_kubectl k" > /etc/bash_completion.d/kubectl-alias
 
 # Reset behavior — what happens when kairos-agent reset is called
 reset:
@@ -990,6 +1012,21 @@ write_files:
         scheduler: {}
         telemetry:
           enabled: false
+  - path: /usr/local/bin/kubectl
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      exec k0s kubectl "\$@"
+  - path: /etc/profile.d/k0s-kubeconfig.sh
+    permissions: "0644"
+    content: |
+      export KUBECONFIG=${K0S_KUBECONFIG}
+      alias k=kubectl
+      if [ -n "\${BASH_VERSION:-}" ]; then
+        for completion in /etc/bash_completion.d/k0s /etc/bash_completion.d/kubectl /etc/bash_completion.d/kubectl-alias; do
+          [ -r "\$completion" ] && . "\$completion"
+        done
+      fi
   - path: ${K0S_TOKEN_FILE}
     permissions: "0644"
     content: |
@@ -1032,6 +1069,13 @@ stages:
       if: "[ ! -d /var/lib/k0s/kubelet ]"
       commands:
         - mkdir -p /var/lib/k0s/kubelet
+    - name: "Configure controller shell defaults"
+      commands:
+        - mkdir -p /etc/profile.d /etc/bash_completion.d /usr/local/bin
+        - chmod 0755 /usr/local/bin/kubectl
+        - k0s completion bash > /etc/bash_completion.d/k0s 2>/dev/null || true
+        - kubectl completion bash > /etc/bash_completion.d/kubectl 2>/dev/null || true
+        - printf "%s\n" "complete -o default -F __start_kubectl k" > /etc/bash_completion.d/kubectl-alias
 
 reset:
   reboot: true
@@ -1577,7 +1621,7 @@ install_cilium() {
     install_cilium_cli
 
     # NOTE: k8sServiceHost points to the controller; k0s API port is 6443
-    cilium install \
+    if ! cilium install \
         --kubeconfig "$K0S_KUBECONFIG" \
         --set k8sServiceHost="${CONTROLLER_IP}" \
         --set k8sServicePort=6443 \
@@ -1598,9 +1642,15 @@ install_cilium() {
         --set hubble.relay.enabled=false \
         --set hubble.enabled=false \
         --set hubble.ui.enabled=false \
-        --set bgp.announce.loadbalancerIP=true
+        --set bgp.announce.loadbalancerIP=true; then
+        print_error "Cilium install failed."
+        return 1
+    fi
 
-    cilium status --wait
+    if ! cilium status --kubeconfig "$K0S_KUBECONFIG" --wait; then
+        print_warning "Cilium was submitted, but status did not become ready yet."
+        return 1
+    fi
     print_successful "Cilium installed"
 }
 
@@ -2070,7 +2120,7 @@ check_cluster_status() {
     echo ""
     if command -v cilium &>/dev/null; then
         print_info "Cilium status:"
-        cilium status 2>/dev/null || print_info "Cilium CLI found but unable to get status."
+        cilium status --kubeconfig "$K0S_KUBECONFIG" 2>/dev/null || print_info "Cilium CLI found but unable to get status."
     else
         if k0s kubectl get daemonset cilium -n kube-system &>/dev/null; then
             print_info "Cilium CLI not installed, but Cilium pods were found:"
@@ -2365,11 +2415,16 @@ upgrade_cilium() {
     [ -n "$CILIUM_VERSION" ] && VERSION_FLAG="--version $CILIUM_VERSION"
 
     print_info "Upgrading Cilium in cluster..."
-    export KUBECONFIG="${K0S_KUBECONFIG}"
-    cilium upgrade $VERSION_FLAG
+    if ! cilium upgrade --kubeconfig "$K0S_KUBECONFIG" $VERSION_FLAG; then
+        print_error "Cilium upgrade failed."
+        return 1
+    fi
 
     print_info "Waiting for Cilium to be ready..."
-    cilium status --wait
+    if ! cilium status --kubeconfig "$K0S_KUBECONFIG" --wait; then
+        print_warning "Cilium upgrade was submitted, but status did not become ready yet."
+        return 1
+    fi
     print_successful "Cilium upgrade completed."
 }
 
@@ -2942,7 +2997,7 @@ manage_cilium() {
         3) check_cilium_version ;;
         4)
             if command -v cilium &>/dev/null; then
-                cilium status
+                cilium status --kubeconfig "$K0S_KUBECONFIG"
             else
                 print_error "Cilium CLI not installed."
             fi
