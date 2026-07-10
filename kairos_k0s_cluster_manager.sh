@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.39"
+SCRIPT_VERSION="1.0.40"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -591,9 +591,51 @@ write_files:
       export KUBECONFIG=${K0S_KUBECONFIG}
       alias k=kubectl
       if [ -n "\${BASH_VERSION:-}" ]; then
-        for completion in /etc/bash_completion.d/k0s /etc/bash_completion.d/kubectl /etc/bash_completion.d/kubectl-alias; do
+        for completion in /usr/share/bash-completion/bash_completion /etc/bash_completion; do
           [ -r "\$completion" ] && . "\$completion"
         done
+        for completion in /etc/bash_completion.d/k0s-compat /etc/bash_completion.d/k0s /etc/bash_completion.d/kubectl /etc/bash_completion.d/kubectl-alias; do
+          [ -r "\$completion" ] && . "\$completion"
+        done
+      fi
+  - path: /etc/bash_completion.d/k0s-compat
+    permissions: "0644"
+    content: |
+      if ! type _get_comp_words_by_ref >/dev/null 2>&1; then
+        _get_comp_words_by_ref() {
+          local OPTIND opt cur_var prev_var words_var cword_var
+          while getopts "n:" opt; do :; done
+          shift \$((OPTIND - 1))
+          while [ \$# -gt 0 ]; do
+            case "\$1" in
+              cur) cur_var=cur ;;
+              prev) prev_var=prev ;;
+              words) words_var=words ;;
+              cword) cword_var=cword ;;
+              *) ;;
+            esac
+            shift
+          done
+          [ -n "\$cur_var" ] && printf -v "\$cur_var" '%s' "\${COMP_WORDS[COMP_CWORD]}"
+          if [ -n "\$prev_var" ]; then
+            if [ "\$COMP_CWORD" -gt 0 ]; then
+              printf -v "\$prev_var" '%s' "\${COMP_WORDS[COMP_CWORD-1]}"
+            else
+              printf -v "\$prev_var" '%s' ""
+            fi
+          fi
+          [ -n "\$words_var" ] && eval "\$words_var=(\"\${COMP_WORDS[@]}\")"
+          [ -n "\$cword_var" ] && printf -v "\$cword_var" '%s' "\$COMP_CWORD"
+        }
+      fi
+      if ! type _init_completion >/dev/null 2>&1; then
+        _init_completion() {
+          COMPREPLY=()
+          _get_comp_words_by_ref "\$@" cur prev words cword
+        }
+      fi
+      if ! type __ltrim_colon_completions >/dev/null 2>&1; then
+        __ltrim_colon_completions() { return 0; }
       fi
   - path: /root/kairos-cluster-manager.sh
     permissions: "0755"
@@ -642,7 +684,7 @@ stages:
         - chmod 0755 /usr/local/bin/kubectl
         - k0s completion bash > /etc/bash_completion.d/k0s 2>/dev/null || true
         - kubectl completion bash > /etc/bash_completion.d/kubectl 2>/dev/null || true
-        - printf "%s\n" "complete -o default -F __start_kubectl k" > /etc/bash_completion.d/kubectl-alias
+        - printf "%s\n" "type __start_kubectl >/dev/null 2>&1 && complete -o default -F __start_kubectl k" > /etc/bash_completion.d/kubectl-alias
 
 # Reset behavior — what happens when kairos-agent reset is called
 reset:
@@ -1023,9 +1065,51 @@ write_files:
       export KUBECONFIG=${K0S_KUBECONFIG}
       alias k=kubectl
       if [ -n "\${BASH_VERSION:-}" ]; then
-        for completion in /etc/bash_completion.d/k0s /etc/bash_completion.d/kubectl /etc/bash_completion.d/kubectl-alias; do
+        for completion in /usr/share/bash-completion/bash_completion /etc/bash_completion; do
           [ -r "\$completion" ] && . "\$completion"
         done
+        for completion in /etc/bash_completion.d/k0s-compat /etc/bash_completion.d/k0s /etc/bash_completion.d/kubectl /etc/bash_completion.d/kubectl-alias; do
+          [ -r "\$completion" ] && . "\$completion"
+        done
+      fi
+  - path: /etc/bash_completion.d/k0s-compat
+    permissions: "0644"
+    content: |
+      if ! type _get_comp_words_by_ref >/dev/null 2>&1; then
+        _get_comp_words_by_ref() {
+          local OPTIND opt cur_var prev_var words_var cword_var
+          while getopts "n:" opt; do :; done
+          shift \$((OPTIND - 1))
+          while [ \$# -gt 0 ]; do
+            case "\$1" in
+              cur) cur_var=cur ;;
+              prev) prev_var=prev ;;
+              words) words_var=words ;;
+              cword) cword_var=cword ;;
+              *) ;;
+            esac
+            shift
+          done
+          [ -n "\$cur_var" ] && printf -v "\$cur_var" '%s' "\${COMP_WORDS[COMP_CWORD]}"
+          if [ -n "\$prev_var" ]; then
+            if [ "\$COMP_CWORD" -gt 0 ]; then
+              printf -v "\$prev_var" '%s' "\${COMP_WORDS[COMP_CWORD-1]}"
+            else
+              printf -v "\$prev_var" '%s' ""
+            fi
+          fi
+          [ -n "\$words_var" ] && eval "\$words_var=(\"\${COMP_WORDS[@]}\")"
+          [ -n "\$cword_var" ] && printf -v "\$cword_var" '%s' "\$COMP_CWORD"
+        }
+      fi
+      if ! type _init_completion >/dev/null 2>&1; then
+        _init_completion() {
+          COMPREPLY=()
+          _get_comp_words_by_ref "\$@" cur prev words cword
+        }
+      fi
+      if ! type __ltrim_colon_completions >/dev/null 2>&1; then
+        __ltrim_colon_completions() { return 0; }
       fi
   - path: ${K0S_TOKEN_FILE}
     permissions: "0644"
@@ -1075,7 +1159,7 @@ stages:
         - chmod 0755 /usr/local/bin/kubectl
         - k0s completion bash > /etc/bash_completion.d/k0s 2>/dev/null || true
         - kubectl completion bash > /etc/bash_completion.d/kubectl 2>/dev/null || true
-        - printf "%s\n" "complete -o default -F __start_kubectl k" > /etc/bash_completion.d/kubectl-alias
+        - printf "%s\n" "type __start_kubectl >/dev/null 2>&1 && complete -o default -F __start_kubectl k" > /etc/bash_completion.d/kubectl-alias
 
 reset:
   reboot: true
