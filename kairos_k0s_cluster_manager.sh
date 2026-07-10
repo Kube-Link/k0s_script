@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.38"
+SCRIPT_VERSION="1.0.39"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -355,7 +355,7 @@ generate_config_file() {
     SERVICE_CIDR=${SERVICE_CIDR:-$DEFAULT_SERVICE_CIDR}
     SERVICE_CIDR=$(trim_value "$SERVICE_CIDR")
 
-    prompt_yn INSTALL_CILIUM "Auto-install Cilium after all workers are installed and registered? (y/n, default: n): " "n" || return 1
+    prompt_yn INSTALL_CILIUM "Auto-install Cilium before worker installation? (y/n, default: n): " "n" || return 1
 
     read -p "GitHub username for SSH key injection: " GITHUB_USER || return 1
     GITHUB_USER=$(trim_value "$GITHUB_USER")
@@ -1288,12 +1288,13 @@ wait_for_configured_workers_registered() {
     return 1
 }
 
-maybe_auto_install_cilium_after_worker_install() {
+ensure_cilium_before_worker_install() {
     cilium_requested || return 0
 
-    if [ ${#WORKERS[@]} -eq 0 ]; then
-        print_info "INSTALL_CILIUM=y, but no separate workers are configured."
-        return 0
+    if ! command -v k0s &>/dev/null; then
+        print_warning "INSTALL_CILIUM=y, but k0s was not found on this machine."
+        print_info "Run this worker install action from a controller, or install Cilium manually first."
+        return 1
     fi
 
     if cilium_already_installed; then
@@ -1301,31 +1302,9 @@ maybe_auto_install_cilium_after_worker_install() {
         return 0
     fi
 
-    local submitted_count
-    submitted_count=$(count_submitted_worker_installs)
-    if ! all_worker_installs_submitted; then
-        print_info "INSTALL_CILIUM=y. Waiting until all worker installs are submitted before deploying Cilium (${submitted_count}/${#WORKERS[@]} submitted)."
-        return 0
-    fi
-
-    print_successful "All configured worker install requests have been submitted (${submitted_count}/${#WORKERS[@]})."
-    print_warning "Cilium will install only after the workers reboot and appear as k0s nodes."
-    read -p "Wait for workers and install Cilium now? (y/n, default: y): " install_now
-    install_now=${install_now:-y}
-    if [ "$install_now" != "y" ]; then
-        print_info "Auto install skipped. Later run Manage Cilium -> Install Cilium."
-        return 0
-    fi
-
-    wait_for_configured_workers_registered 1800 || return 1
-
-    if cilium_already_installed; then
-        print_successful "Cilium is already installed."
-        return 0
-    fi
-
-    print_info "Installing Cilium now..."
-    install_cilium
+    print_info "INSTALL_CILIUM=y. Installing Cilium before worker install requests..."
+    print_info "Status wait is skipped until workers join."
+    install_cilium skip-wait
 }
 
 inject_cloudconfig_webinstaller() {
@@ -1510,9 +1489,10 @@ inject_one_worker() {
         return 1
     fi
 
+    ensure_cilium_before_worker_install || return 1
+
     if inject_cloudconfig_webinstaller "$(worker_cloudconfig_file_for_ip "$worker_ip")" "$worker_ip"; then
         mark_worker_install_submitted "$worker_ip"
-        maybe_auto_install_cilium_after_worker_install
     fi
 }
 
@@ -1522,6 +1502,8 @@ inject_all_workers() {
         return 0
     fi
 
+    ensure_cilium_before_worker_install || return 1
+
     local worker_ip
     for worker_ip in "${WORKERS[@]}"; do
         if inject_cloudconfig_webinstaller "$(worker_cloudconfig_file_for_ip "$worker_ip")" "$worker_ip"; then
@@ -1530,8 +1512,6 @@ inject_all_workers() {
             return 1
         fi
     done
-
-    maybe_auto_install_cilium_after_worker_install
 }
 
 manage_web_installer() {
@@ -1617,34 +1597,47 @@ install_cilium_cli() {
 }
 
 install_cilium() {
+    local wait_mode="${1:-wait}"
+
     print_info "Installing Cilium (k0s kubeconfig: $K0S_KUBECONFIG)..."
     install_cilium_cli
 
+    local install_args=(
+        --kubeconfig "$K0S_KUBECONFIG"
+        --set k8sServiceHost="${CONTROLLER_IP}"
+        --set k8sServicePort=6443
+        --set kubeProxyReplacement=true
+        --set tunnelProtocol=geneve
+        --set loadBalancer.mode=dsr
+        --set loadBalancer.dsrDispatch=geneve
+        --set ipam.operator.clusterPoolIPv4PodCIDRList="${POD_CIDR}"
+        --set ipv4.enabled=true
+        --set enableIPv4Masquerade=true
+        --set ipMasqAgent.enable=false
+        --set routingMode=native
+        --set ipam.mode=cluster-pool
+        --set ipv4NativeRoutingCIDR="${POD_CIDR}"
+        --set autoDirectNodeRoutes=true
+        --set bpf.masquerade=true
+        --set bgpControlPlane.enabled=true
+        --set hubble.relay.enabled=false
+        --set hubble.enabled=false
+        --set hubble.ui.enabled=false
+        --set bgp.announce.loadbalancerIP=true
+    )
+
+    [ "$wait_mode" = "skip-wait" ] && install_args+=(--wait=false)
+
     # NOTE: k8sServiceHost points to the controller; k0s API port is 6443
-    if ! cilium install \
-        --kubeconfig "$K0S_KUBECONFIG" \
-        --set k8sServiceHost="${CONTROLLER_IP}" \
-        --set k8sServicePort=6443 \
-        --set kubeProxyReplacement=true \
-        --set tunnelProtocol=geneve \
-        --set loadBalancer.mode=dsr \
-        --set loadBalancer.dsrDispatch=geneve \
-        --set ipam.operator.clusterPoolIPv4PodCIDRList="${POD_CIDR}" \
-        --set ipv4.enabled=true \
-        --set enableIPv4Masquerade=true \
-        --set ipMasqAgent.enable=false \
-        --set routingMode=native \
-        --set ipam.mode=cluster-pool \
-        --set ipv4NativeRoutingCIDR="${POD_CIDR}" \
-        --set autoDirectNodeRoutes=true \
-        --set bpf.masquerade=true \
-        --set bgpControlPlane.enabled=true \
-        --set hubble.relay.enabled=false \
-        --set hubble.enabled=false \
-        --set hubble.ui.enabled=false \
-        --set bgp.announce.loadbalancerIP=true; then
+    if ! cilium install "${install_args[@]}"; then
         print_error "Cilium install failed."
         return 1
+    fi
+
+    if [ "$wait_mode" = "skip-wait" ]; then
+        print_successful "Cilium install submitted."
+        print_info "Cilium pods will become ready automatically when worker nodes join."
+        return 0
     fi
 
     if ! cilium status --kubeconfig "$K0S_KUBECONFIG" --wait; then
