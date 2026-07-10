@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.32"
+SCRIPT_VERSION="1.0.33"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -1638,19 +1638,201 @@ kairos_rolling_upgrade() {
 # -----------------------------------------------------------------------------
 # Status checks
 # -----------------------------------------------------------------------------
-check_k0s_version() {
-    print_info "Checking k0s version (local)..."
-    if command -v k0s &>/dev/null; then
-        k0s version
+release_file_value() {
+    local file="$1"
+    local key="$2"
+
+    [ -f "$file" ] || return 1
+    sed -n "s/^${key}=//p" "$file" | head -n 1 | tr -d '"'
+}
+
+ensure_v_prefix() {
+    local version="$1"
+
+    [ -z "$version" ] && return 0
+    case "$version" in
+        v*) printf '%s\n' "$version" ;;
+        *) printf 'v%s\n' "$version" ;;
+    esac
+}
+
+version_tags_equal() {
+    local left="$1"
+    local right="$2"
+
+    [ "$left" = "$right" ] || [ "${left#v}" = "${right#v}" ]
+}
+
+fetch_github_release_tags() {
+    local repo="$1"
+
+    curl -s --connect-timeout 5 --max-time 15 "https://api.github.com/repos/${repo}/releases?per_page=100" 2>/dev/null | github_release_tags
+}
+
+print_release_lines() {
+    local releases="$1"
+    local limit="${2:-5}"
+    local printed=0
+    local version
+
+    while IFS= read -r version; do
+        [ -z "$version" ] && continue
+        echo "   $version"
+        printed=$((printed + 1))
+        [ "$printed" -ge "$limit" ] && break
+    done <<< "$releases"
+
+    [ "$printed" -eq 0 ] && echo "   unavailable"
+}
+
+print_release_context() {
+    local label="$1"
+    local repo="$2"
+    local current_version="$3"
+    local releases
+    local latest_version
+    local version
+    local found="n"
+    local -a newer_versions=()
+    local -a previous_versions=()
+
+    releases=$(fetch_github_release_tags "$repo")
+    if [ -z "$releases" ]; then
+        print_warning "Could not fetch ${label} releases from GitHub."
+        return 0
+    fi
+
+    latest_version=$(printf '%s\n' "$releases" | head -n 1)
+    [ -n "$latest_version" ] && print_successful "Latest available ${label}: $latest_version"
+
+    if [ -z "$current_version" ]; then
+        print_info "Latest ${label} releases (last 5):"
+        print_release_lines "$releases" 5
+        return 0
+    fi
+
+    while IFS= read -r version; do
+        [ -z "$version" ] && continue
+
+        if [ "$found" = "n" ]; then
+            if version_tags_equal "$version" "$current_version"; then
+                found="y"
+                continue
+            fi
+            [ "${#newer_versions[@]}" -lt 5 ] && newer_versions+=("$version")
+        else
+            [ "${#previous_versions[@]}" -lt 5 ] && previous_versions+=("$version")
+        fi
+
+        [ "$found" = "y" ] && [ "${#previous_versions[@]}" -ge 5 ] && break
+    done <<< "$releases"
+
+    if [ "$found" != "y" ]; then
+        print_warning "Running ${label} version was not found in the latest GitHub release window."
+        print_info "Latest ${label} releases (last 5):"
+        print_release_lines "$releases" 5
+        return 0
+    fi
+
+    print_info "Newer ${label} releases:"
+    if [ "${#newer_versions[@]}" -eq 0 ]; then
+        echo "   none detected"
     else
-        print_error "k0s not found on this node."
+        printf '   %s\n' "${newer_versions[@]}"
+    fi
+
+    print_info "Previous ${label} releases:"
+    if [ "${#previous_versions[@]}" -eq 0 ]; then
+        echo "   none detected"
+    else
+        printf '   %s\n' "${previous_versions[@]}"
     fi
 }
 
+version_kubectl() {
+    local output
+    local rc
+
+    if command -v kubectl &>/dev/null; then
+        output=$(KUBECONFIG="$K0S_KUBECONFIG" kubectl "$@" 2>/dev/null)
+        rc=$?
+        if [ "$rc" -eq 0 ]; then
+            printf '%s\n' "$output"
+            return 0
+        fi
+    fi
+
+    if command -v k0s &>/dev/null; then
+        k0s kubectl "$@"
+        return $?
+    fi
+
+    return 127
+}
+
+get_k0s_running_version() {
+    command -v k0s &>/dev/null || return 1
+    k0s status 2>/dev/null | awk -F': ' '/^Version:/ { print $2; exit }'
+}
+
+get_k0s_binary_version() {
+    command -v k0s &>/dev/null || return 1
+    k0s version 2>/dev/null | head -n 1 | tr -d '[:space:]'
+}
+
+check_k0s_version() {
+    print_info "Checking k0s version..."
+
+    local running_version
+    local binary_version
+    local compare_version
+
+    running_version=$(get_k0s_running_version)
+    binary_version=$(get_k0s_binary_version)
+    compare_version="${running_version:-$binary_version}"
+
+    if [ -n "$running_version" ]; then
+        print_successful "Running k0s version: $running_version"
+    else
+        print_warning "Running k0s version: not detected"
+    fi
+
+    if [ -n "$binary_version" ]; then
+        if [ "$binary_version" != "$running_version" ]; then
+            print_info "Local k0s binary version: $binary_version"
+        fi
+    else
+        print_error "k0s not found on this node."
+    fi
+
+    print_release_context "k0s" "k0sproject/k0s" "$compare_version"
+}
+
 check_kairos_version() {
-    print_info "Checking Kairos version (local)..."
-    cat /etc/kairos-release 2>/dev/null || kairos-agent version 2>/dev/null || \
+    print_info "Checking Kairos version..."
+
+    local kairos_version
+    local kairos_name
+    local kairos_software_version
+    local kairos_init_version
+
+    kairos_version=$(release_file_value /etc/kairos-release KAIROS_VERSION)
+    kairos_name=$(release_file_value /etc/kairos-release KAIROS_NAME)
+    kairos_software_version=$(release_file_value /etc/kairos-release KAIROS_SOFTWARE_VERSION)
+    kairos_init_version=$(release_file_value /etc/kairos-release KAIROS_INIT_VERSION)
+
+    if [ -n "$kairos_version" ]; then
+        print_successful "Running Kairos version: $kairos_version"
+        [ -n "$kairos_name" ] && print_info "Kairos image: $kairos_name"
+        [ -n "$kairos_software_version" ] && print_info "Embedded k0s version: $kairos_software_version"
+        [ -n "$kairos_init_version" ] && print_info "Kairos init version: $kairos_init_version"
+    elif command -v kairos-agent &>/dev/null; then
+        kairos-agent version 2>/dev/null || print_error "Could not determine Kairos version."
+    else
         print_error "Could not determine Kairos version."
+    fi
+
+    print_release_context "Kairos" "kairos-io/kairos" "$kairos_version"
 }
 
 check_script_version() {
@@ -1756,121 +1938,211 @@ github_release_tags() {
 # -----------------------------------------------------------------------------
 # Cilium version / upgrade checks (ported from k3s script)
 # -----------------------------------------------------------------------------
+get_cilium_cli_version() {
+    command -v cilium &>/dev/null || return 1
+    cilium version 2>/dev/null | awk '/cilium-cli/ { print $2; exit }'
+}
+
+get_cilium_cluster_version() {
+    local image
+    local image_tail
+    local version
+
+    version_kubectl get daemonset cilium -n kube-system &>/dev/null || return 1
+    image=$(version_kubectl get daemonset cilium -n kube-system -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)
+    [ -n "$image" ] || return 1
+
+    image="${image%%@*}"
+    image_tail="${image##*/}"
+    [[ "$image_tail" == *:* ]] || return 1
+    version="${image_tail##*:}"
+    [ -n "$version" ] || return 1
+    ensure_v_prefix "$version"
+}
+
+get_latest_cilium_stable_version() {
+    local latest_version
+
+    latest_version=$(curl -s --connect-timeout 5 --max-time 15 https://raw.githubusercontent.com/cilium/cilium/master/stable.txt 2>/dev/null | tr -d '[:space:]')
+    [ -z "$latest_version" ] && latest_version=$(curl -s --connect-timeout 5 --max-time 15 https://api.github.com/repos/cilium/cilium/releases/latest 2>/dev/null | github_release_tags | head -n 1)
+    printf '%s\n' "$latest_version"
+}
+
 check_cilium_version() {
-    print_info "Checking current Cilium version..."
+    print_info "Checking Cilium version..."
 
-    if command -v cilium &>/dev/null; then
-        local cli_version=$(cilium version 2>/dev/null | grep "cilium-cli" | awk '{print $2}')
-        print_successful "Cilium CLI Version: $cli_version"
+    local cli_version
+    local cluster_version
+    local latest_version
 
-        # Check Cilium version in the cluster
-        export KUBECONFIG="${K0S_KUBECONFIG}"
-        if kubectl get pods -n kube-system -l k8s-app=cilium &>/dev/null; then
-            local cilium_version=""
+    cli_version=$(get_cilium_cli_version)
+    cluster_version=$(get_cilium_cluster_version)
+    latest_version=$(get_latest_cilium_stable_version)
 
-            # Try cilium version command
-            cilium_version=$(cilium version 2>/dev/null | grep -E "cilium-daemon|daemon" | head -n1 | awk '{print $2}' | tr -d 'v')
-
-            # Fallback: kubectl from DaemonSet
-            if [ -z "$cilium_version" ] || [ "$cilium_version" = "unknown" ]; then
-                cilium_version=$(kubectl get daemonset cilium -n kube-system -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | cut -d':' -f2)
-            fi
-
-            if [ -n "$cilium_version" ] && [ "$cilium_version" != "unknown" ]; then
-                [[ ! "$cilium_version" =~ ^v ]] && cilium_version="v$cilium_version"
-                print_successful "Cilium Version (in cluster): $cilium_version"
-            else
-                print_warning "Cilium Version (in cluster): Unable to determine"
-                cilium_version=""
-            fi
-
-            # Check latest stable
-            print_info "Checking latest stable Cilium version..."
-            local latest_version
-            latest_version=$(curl -s https://raw.githubusercontent.com/cilium/cilium/master/stable.txt 2>/dev/null)
-            [ -z "$latest_version" ] && latest_version=$(curl -s https://api.github.com/repos/cilium/cilium/releases/latest 2>/dev/null | github_release_tags | head -n 1)
-            print_successful "Latest Stable Cilium Version: $latest_version"
-
-            if [ -n "$cilium_version" ] && [ "$cilium_version" = "$latest_version" ]; then
-                print_successful "You are running the latest stable version."
-            elif [ -n "$cilium_version" ]; then
-                print_info "An upgrade is available from $cilium_version to $latest_version"
-            fi
-        else
-            print_info "Cilium CLI is installed, but Cilium is not detected in the cluster."
-            local latest_version
-            latest_version=$(curl -s https://raw.githubusercontent.com/cilium/cilium/master/stable.txt 2>/dev/null)
-            [ -z "$latest_version" ] && latest_version=$(curl -s https://api.github.com/repos/cilium/cilium/releases/latest 2>/dev/null | github_release_tags | head -n 1)
-            print_successful "Latest Stable Cilium Version: $latest_version"
-        fi
+    if [ -n "$cluster_version" ]; then
+        print_successful "Running Cilium version: $cluster_version"
     else
-        print_error "Cilium CLI is not installed or not in PATH."
-        local latest_version
-        latest_version=$(curl -s https://raw.githubusercontent.com/cilium/cilium/master/stable.txt 2>/dev/null)
-        [ -z "$latest_version" ] && latest_version=$(curl -s https://api.github.com/repos/cilium/cilium/releases/latest 2>/dev/null | github_release_tags | head -n 1)
-        print_successful "Latest Stable Cilium Version: $latest_version"
+        print_warning "Running Cilium version: not detected in cluster"
     fi
+
+    if [ -n "$cli_version" ]; then
+        print_info "Local Cilium CLI version: $cli_version"
+    else
+        print_warning "Local Cilium CLI version: not installed"
+    fi
+
+    [ -n "$latest_version" ] && print_successful "Latest stable Cilium version: $latest_version"
+
+    if [ -n "$cluster_version" ] && [ -n "$latest_version" ]; then
+        if version_tags_equal "$cluster_version" "$latest_version"; then
+            print_successful "Running Cilium matches the latest stable version."
+        else
+            print_info "Stable upgrade path: $cluster_version -> $latest_version"
+        fi
+    fi
+
+    print_release_context "Cilium" "cilium/cilium" "$cluster_version"
+}
+
+get_flux_cli_version() {
+    command -v flux &>/dev/null || return 1
+    flux --version 2>/dev/null | head -n 1
+}
+
+get_flux_release_tag() {
+    local cli_version
+    local flux_version_output
+    local release_version
+
+    if command -v flux &>/dev/null; then
+        flux_version_output=$(KUBECONFIG="$K0S_KUBECONFIG" flux version 2>/dev/null)
+        release_version=$(printf '%s\n' "$flux_version_output" | awk -F': ' '/^distribution:/ { sub(/^flux-/, "", $2); print $2; exit }')
+        [ -z "$release_version" ] && release_version=$(printf '%s\n' "$flux_version_output" | awk -F': ' '/^flux:/ { print $2; exit }')
+    fi
+
+    if [ -z "$release_version" ]; then
+        cli_version=$(get_flux_cli_version)
+        release_version=$(printf '%s\n' "$cli_version" | grep -Eo 'v?[0-9]+\.[0-9]+\.[0-9]+[^ ]*' | head -n 1)
+    fi
+
+    ensure_v_prefix "$release_version"
+}
+
+get_flux_controller_versions() {
+    version_kubectl get namespace flux-system &>/dev/null || return 1
+    version_kubectl get deployments -n flux-system -o jsonpath='{range .items[*]}{.metadata.name}{"="}{.spec.template.spec.containers[0].image}{"\n"}{end}' 2>/dev/null
+}
+
+print_flux_controller_versions() {
+    local controller_versions="$1"
+    local line
+    local name
+    local image
+    local image_tail
+    local version
+
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        name="${line%%=*}"
+        image="${line#*=}"
+        image="${image%%@*}"
+        image_tail="${image##*/}"
+        if [[ "$image_tail" == *:* ]]; then
+            version="${image_tail##*:}"
+        else
+            version="$image"
+        fi
+        [ -z "$version" ] && version="$image"
+        echo "   ${name}: ${version}"
+    done <<< "$controller_versions"
+}
+
+print_current_version_summary() {
+    local k0s_running_version
+    local kairos_version
+    local cilium_cluster_version
+    local flux_controller_versions
+
+    k0s_running_version=$(get_k0s_running_version)
+    kairos_version=$(release_file_value /etc/kairos-release KAIROS_VERSION)
+    cilium_cluster_version=$(get_cilium_cluster_version)
+    flux_controller_versions=$(get_flux_controller_versions)
+
+    print_info "Current / running versions:"
+    echo "   k0s: ${k0s_running_version:-not detected}"
+    echo "   Kairos: ${kairos_version:-not detected}"
+    echo "   Cilium: ${cilium_cluster_version:-not detected}"
+    if [ -n "$flux_controller_versions" ]; then
+        echo "   FluxCD controllers:"
+        print_flux_controller_versions "$flux_controller_versions"
+    else
+        echo "   FluxCD: not detected"
+    fi
+    echo "   Script: v${SCRIPT_VERSION}"
 }
 
 check_fluxcd_version() {
     print_info "Checking FluxCD version..."
 
-    if command -v flux &>/dev/null; then
-        local cli_version=$(flux --version 2>/dev/null | head -1)
-        print_successful "Flux CLI Version: $cli_version"
+    local cli_version
+    local release_version
+    local controller_versions
+
+    cli_version=$(get_flux_cli_version)
+    release_version=$(get_flux_release_tag)
+    controller_versions=$(get_flux_controller_versions)
+
+    if [ -n "$controller_versions" ]; then
+        print_successful "Running Flux controllers:"
+        print_flux_controller_versions "$controller_versions"
     else
-        print_info "Flux CLI not installed locally."
+        print_warning "Running Flux controllers: not detected in cluster"
     fi
 
-    # Check cluster-side Flux version
-    export KUBECONFIG="${K0S_KUBECONFIG}"
-    if kubectl get namespace flux-system &>/dev/null; then
-        local cluster_version
-        cluster_version=$(kubectl get deployment -n flux-system source-controller -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | cut -d':' -f2)
-        if [ -n "$cluster_version" ]; then
-            print_successful "FluxCD Version (in cluster): $cluster_version"
-        fi
-
-        local latest_version
-        latest_version=$(curl -s https://api.github.com/repos/fluxcd/flux2/releases/latest 2>/dev/null | github_release_tags | head -n 1)
-        [ -n "$latest_version" ] && print_info "Latest FluxCD Version: $latest_version"
+    if [ -n "$cli_version" ]; then
+        print_info "Local Flux CLI version: $cli_version"
     else
-        print_info "FluxCD not detected in cluster."
+        print_warning "Local Flux CLI version: not installed"
     fi
+
+    if [ -n "$release_version" ]; then
+        print_info "Flux release version used for comparison: $release_version"
+    else
+        print_info "Flux release comparison requires the Flux CLI version; showing latest releases only."
+    fi
+
+    print_release_context "FluxCD" "fluxcd/flux2" "$release_version"
 }
 
 list_available_versions() {
+    local latest_cilium_stable
+
     echo -e "${YELLOW}======== Available Versions ========${NC}"
+    print_current_version_summary
+    echo ""
 
     # k0s versions
     print_info "Latest k0s Releases (Last 5):"
-    curl -s https://api.github.com/repos/k0sproject/k0s/releases 2>/dev/null | \
-        github_release_tags | head -n 5 | \
-        while read -r version; do echo "   $version"; done
+    print_release_lines "$(fetch_github_release_tags "k0sproject/k0s")" 5
     echo ""
 
     # Cilium versions
     print_info "Cilium Stable Version:"
-    curl -s https://raw.githubusercontent.com/cilium/cilium/master/stable.txt 2>/dev/null | xargs -I{} echo "   {}"
+    latest_cilium_stable=$(get_latest_cilium_stable_version)
+    echo "   ${latest_cilium_stable:-unavailable}"
     echo ""
     print_info "Latest Cilium Releases (Last 5):"
-    curl -s https://api.github.com/repos/cilium/cilium/releases 2>/dev/null | \
-        github_release_tags | head -n 5 | \
-        while read -r version; do echo "   $version"; done
+    print_release_lines "$(fetch_github_release_tags "cilium/cilium")" 5
     echo ""
 
     # FluxCD versions
     print_info "Latest FluxCD Releases (Last 5):"
-    curl -s https://api.github.com/repos/fluxcd/flux2/releases 2>/dev/null | \
-        github_release_tags | head -n 5 | \
-        while read -r version; do echo "   $version"; done
+    print_release_lines "$(fetch_github_release_tags "fluxcd/flux2")" 5
     echo ""
 
     # Kairos versions
     print_info "Latest Kairos Releases (Last 5):"
-    curl -s https://api.github.com/repos/kairos-io/kairos/releases 2>/dev/null | \
-        github_release_tags | head -n 5 | \
-        while read -r version; do echo "   $version"; done
+    print_release_lines "$(fetch_github_release_tags "kairos-io/kairos")" 5
 
     echo -e "${YELLOW}===================================${NC}"
 }
