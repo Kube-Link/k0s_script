@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.40"
+SCRIPT_VERSION="1.0.41"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -595,7 +595,7 @@ write_files:
           [ -r "\$completion" ] && . "\$completion"
         done
         for completion in /etc/bash_completion.d/k0s-compat /etc/bash_completion.d/k0s /etc/bash_completion.d/kubectl /etc/bash_completion.d/kubectl-alias; do
-          [ -r "\$completion" ] && . "\$completion"
+          [ -r "\$completion" ] && source -- "\$completion"
         done
       fi
   - path: /etc/bash_completion.d/k0s-compat
@@ -683,7 +683,7 @@ stages:
         - mkdir -p /etc/profile.d /etc/bash_completion.d /usr/local/bin
         - chmod 0755 /usr/local/bin/kubectl
         - k0s completion bash > /etc/bash_completion.d/k0s 2>/dev/null || true
-        - kubectl completion bash > /etc/bash_completion.d/kubectl 2>/dev/null || true
+        - k0s kubectl completion bash > /etc/bash_completion.d/kubectl 2>/dev/null || true
         - printf "%s\n" "type __start_kubectl >/dev/null 2>&1 && complete -o default -F __start_kubectl k" > /etc/bash_completion.d/kubectl-alias
 
 # Reset behavior — what happens when kairos-agent reset is called
@@ -1069,7 +1069,7 @@ write_files:
           [ -r "\$completion" ] && . "\$completion"
         done
         for completion in /etc/bash_completion.d/k0s-compat /etc/bash_completion.d/k0s /etc/bash_completion.d/kubectl /etc/bash_completion.d/kubectl-alias; do
-          [ -r "\$completion" ] && . "\$completion"
+          [ -r "\$completion" ] && source -- "\$completion"
         done
       fi
   - path: /etc/bash_completion.d/k0s-compat
@@ -1158,7 +1158,7 @@ stages:
         - mkdir -p /etc/profile.d /etc/bash_completion.d /usr/local/bin
         - chmod 0755 /usr/local/bin/kubectl
         - k0s completion bash > /etc/bash_completion.d/k0s 2>/dev/null || true
-        - kubectl completion bash > /etc/bash_completion.d/kubectl 2>/dev/null || true
+        - k0s kubectl completion bash > /etc/bash_completion.d/kubectl 2>/dev/null || true
         - printf "%s\n" "type __start_kubectl >/dev/null 2>&1 && complete -o default -F __start_kubectl k" > /etc/bash_completion.d/kubectl-alias
 
 reset:
