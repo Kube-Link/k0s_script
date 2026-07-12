@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.41"
+SCRIPT_VERSION="1.0.42"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -598,6 +598,18 @@ write_files:
           [ -r "\$completion" ] && source -- "\$completion"
         done
       fi
+  - path: /root/.bashrc
+    permissions: "0644"
+    content: |
+      if [ -r /etc/profile.d/k0s-kubeconfig.sh ]; then
+        . /etc/profile.d/k0s-kubeconfig.sh
+      fi
+  - path: /root/.bash_profile
+    permissions: "0644"
+    content: |
+      if [ -r "\$HOME/.bashrc" ]; then
+        . "\$HOME/.bashrc"
+      fi
   - path: /etc/bash_completion.d/k0s-compat
     permissions: "0644"
     content: |
@@ -1071,6 +1083,18 @@ write_files:
         for completion in /etc/bash_completion.d/k0s-compat /etc/bash_completion.d/k0s /etc/bash_completion.d/kubectl /etc/bash_completion.d/kubectl-alias; do
           [ -r "\$completion" ] && source -- "\$completion"
         done
+      fi
+  - path: /root/.bashrc
+    permissions: "0644"
+    content: |
+      if [ -r /etc/profile.d/k0s-kubeconfig.sh ]; then
+        . /etc/profile.d/k0s-kubeconfig.sh
+      fi
+  - path: /root/.bash_profile
+    permissions: "0644"
+    content: |
+      if [ -r "\$HOME/.bashrc" ]; then
+        . "\$HOME/.bashrc"
       fi
   - path: /etc/bash_completion.d/k0s-compat
     permissions: "0644"
