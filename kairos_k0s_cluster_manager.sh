@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.48"
+SCRIPT_VERSION="1.0.49"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -642,9 +642,14 @@ write_files:
         for completion in /usr/share/bash-completion/bash_completion /etc/bash_completion; do
           [ -r "\$completion" ] && . "\$completion"
         done
-        for completion in /etc/bash_completion.d/k0s-compat /etc/bash_completion.d/k0s /etc/bash_completion.d/kubectl; do
+        for completion in /etc/bash_completion.d/k0s-compat /etc/bash_completion.d/k0s; do
           [ -r "\$completion" ] && source -- "\$completion"
         done
+        if [ -s /etc/bash_completion.d/kubectl ]; then
+          source -- /etc/bash_completion.d/kubectl
+        elif [ -x /var/lib/k0s/bin/kubectl ]; then
+          source <(/var/lib/k0s/bin/kubectl completion bash 2>/dev/null)
+        fi
         type __start_kubectl >/dev/null 2>&1 && complete -o default -F __start_kubectl kubectl k
       fi
   - path: /root/.bashrc
@@ -1165,9 +1170,14 @@ write_files:
         for completion in /usr/share/bash-completion/bash_completion /etc/bash_completion; do
           [ -r "\$completion" ] && . "\$completion"
         done
-        for completion in /etc/bash_completion.d/k0s-compat /etc/bash_completion.d/k0s /etc/bash_completion.d/kubectl; do
+        for completion in /etc/bash_completion.d/k0s-compat /etc/bash_completion.d/k0s; do
           [ -r "\$completion" ] && source -- "\$completion"
         done
+        if [ -s /etc/bash_completion.d/kubectl ]; then
+          source -- /etc/bash_completion.d/kubectl
+        elif [ -x /var/lib/k0s/bin/kubectl ]; then
+          source <(/var/lib/k0s/bin/kubectl completion bash 2>/dev/null)
+        fi
         type __start_kubectl >/dev/null 2>&1 && complete -o default -F __start_kubectl kubectl k
       fi
   - path: /root/.bashrc
