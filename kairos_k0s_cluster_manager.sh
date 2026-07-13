@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.43"
+SCRIPT_VERSION="1.0.44"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -597,6 +597,10 @@ write_files:
         for completion in /etc/bash_completion.d/k0s-compat /etc/bash_completion.d/k0s /etc/bash_completion.d/kubectl /etc/bash_completion.d/kubectl-alias; do
           [ -r "\$completion" ] && source -- "\$completion"
         done
+        if ! type __start_kubectl >/dev/null 2>&1 && command -v k0s >/dev/null 2>&1; then
+          source <(k0s kubectl completion bash 2>/dev/null)
+        fi
+        type __start_kubectl >/dev/null 2>&1 && complete -o default -F __start_kubectl kubectl k
       fi
   - path: /root/.bashrc
     permissions: "0644"
@@ -699,7 +703,7 @@ stages:
         - chmod 0755 /usr/local/bin/kubectl
         - k0s completion bash > /etc/bash_completion.d/k0s 2>/dev/null || true
         - k0s kubectl completion bash > /etc/bash_completion.d/kubectl 2>/dev/null || true
-        - printf "%s\n" "type __start_kubectl >/dev/null 2>&1 && complete -o default -F __start_kubectl k" > /etc/bash_completion.d/kubectl-alias
+        - printf "%s\n" "type __start_kubectl >/dev/null 2>&1 && complete -o default -F __start_kubectl kubectl k" > /etc/bash_completion.d/kubectl-alias
 
 # Reset behavior — what happens when kairos-agent reset is called
 reset:
@@ -1086,6 +1090,10 @@ write_files:
         for completion in /etc/bash_completion.d/k0s-compat /etc/bash_completion.d/k0s /etc/bash_completion.d/kubectl /etc/bash_completion.d/kubectl-alias; do
           [ -r "\$completion" ] && source -- "\$completion"
         done
+        if ! type __start_kubectl >/dev/null 2>&1 && command -v k0s >/dev/null 2>&1; then
+          source <(k0s kubectl completion bash 2>/dev/null)
+        fi
+        type __start_kubectl >/dev/null 2>&1 && complete -o default -F __start_kubectl kubectl k
       fi
   - path: /root/.bashrc
     permissions: "0644"
@@ -1189,7 +1197,7 @@ stages:
         - chmod 0755 /usr/local/bin/kubectl
         - k0s completion bash > /etc/bash_completion.d/k0s 2>/dev/null || true
         - k0s kubectl completion bash > /etc/bash_completion.d/kubectl 2>/dev/null || true
-        - printf "%s\n" "type __start_kubectl >/dev/null 2>&1 && complete -o default -F __start_kubectl k" > /etc/bash_completion.d/kubectl-alias
+        - printf "%s\n" "type __start_kubectl >/dev/null 2>&1 && complete -o default -F __start_kubectl kubectl k" > /etc/bash_completion.d/kubectl-alias
 
 reset:
   reboot: true
