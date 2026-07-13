@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.46"
+SCRIPT_VERSION="1.0.48"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -250,7 +250,7 @@ validate_config_file() {
     validation_output=$(bash -c '
         source "$1" || exit 1
         failed=0
-        for key in CONTROLLER_COUNT CONTROLLER_WORKER CONTROLLER_IP ADDITIONAL_CONTROLLERS WORKERS CLUSTER_NAME POD_CIDR SERVICE_CIDR INSTALL_CILIUM GITHUB_USER SSH_PUBKEY HYPERVISOR; do
+        for key in CONTROLLER_COUNT CONTROLLER_WORKER CONTROLLER_IP ADDITIONAL_CONTROLLERS WORKERS CLUSTER_NAME POD_CIDR SERVICE_CIDR INSTALL_CILIUM GITHUB_USER SSH_PUBKEY; do
             if ! declare -p "$key" >/dev/null 2>&1; then
                 echo "Missing required config key: $key"
                 failed=1
@@ -409,10 +409,6 @@ generate_config_file() {
         read -p "Press Enter to continue..."
     fi
 
-    read -p "Hypervisor (proxmox/hyperv): " HYPERVISOR || return 1
-    HYPERVISOR=${HYPERVISOR:-proxmox}
-    HYPERVISOR=$(trim_value "$HYPERVISOR")
-
     write_config_value "$tmp_config" "CONTROLLER_COUNT" "$CONTROLLER_COUNT"
     write_config_value "$tmp_config" "CONTROLLER_WORKER" "$CONTROLLER_WORKER"
     write_config_value "$tmp_config" "CONTROLLER_IP" "$CONTROLLER_IP"
@@ -424,7 +420,6 @@ generate_config_file() {
     write_config_value "$tmp_config" "INSTALL_CILIUM" "$INSTALL_CILIUM"
     write_config_value "$tmp_config" "GITHUB_USER" "$GITHUB_USER"
     write_config_value "$tmp_config" "SSH_PUBKEY" "$SSH_PUBKEY"
-    write_config_value "$tmp_config" "HYPERVISOR" "$HYPERVISOR"
 
     if ! validate_config_file "$tmp_config"; then
         print_error "New config failed validation. Existing $CONFIG_FILE was not changed."
@@ -690,7 +685,10 @@ write_files:
               printf -v "\$prev_var" '%s' ""
             fi
           fi
-          [ -n "\$words_var" ] && eval "\$words_var=(\"\${COMP_WORDS[@]}\")"
+          if [ -n "\$words_var" ]; then
+            local -n words_ref="\$words_var"
+            words_ref=("\${COMP_WORDS[@]}")
+          fi
           [ -n "\$cword_var" ] && printf -v "\$cword_var" '%s' "\$COMP_CWORD"
         }
       fi
@@ -724,7 +722,6 @@ write_files:
       INSTALL_CILIUM=${INSTALL_CILIUM}
       GITHUB_USER=${GITHUB_USER}
       SSH_PUBKEY='${SSH_PUBKEY}'
-      HYPERVISOR=${HYPERVISOR}
 
 # Persistent paths — survive reboots and OS upgrades (read-write bind mounts)
 # k0s state and kubelet must persist on an immutable OS
@@ -764,17 +761,7 @@ reset:
 upgrade:
   reboot: true
 
-# Proxmox integration (only when running on Proxmox)
 EOF
-
-    # Conditionally add qemu-guest-agent bundle for Proxmox
-    if [ "${HYPERVISOR:-proxmox}" = "proxmox" ]; then
-        cat >> "$CONTROLLER_CC_FILE" << 'BUNDLEEOF'
-bundles:
-  - targets:
-      - run://quay.io/kairos/community-bundles:qemu-guest-agent_latest
-BUNDLEEOF
-    fi
 
     print_successful "Controller cloud-config written to $CONTROLLER_CC_FILE"
     print_info "Next: use main menu option 5 -> 1 to send this config to the primary controller installer."
@@ -876,7 +863,6 @@ write_files:
       INSTALL_CILIUM=${INSTALL_CILIUM}
       GITHUB_USER=${GITHUB_USER}
       SSH_PUBKEY='${SSH_PUBKEY}'
-      HYPERVISOR=${HYPERVISOR}
 
 # Persistent paths — survive reboots and OS upgrades (read-write bind mounts)
 bind_mounts:
@@ -908,17 +894,7 @@ reset:
 upgrade:
   reboot: true
 
-# Proxmox integration (only when running on Proxmox)
 EOF
-
-    # Conditionally add qemu-guest-agent bundle for Proxmox
-    if [ "${HYPERVISOR:-proxmox}" = "proxmox" ]; then
-        cat >> "$OUTPUT_FILE" << 'BUNDLEEOF'
-bundles:
-  - targets:
-      - run://quay.io/kairos/community-bundles:qemu-guest-agent_latest
-BUNDLEEOF
-    fi
 
     print_successful "Worker cloud-config written to ${OUTPUT_FILE}"
 }
@@ -1232,7 +1208,10 @@ write_files:
               printf -v "\$prev_var" '%s' ""
             fi
           fi
-          [ -n "\$words_var" ] && eval "\$words_var=(\"\${COMP_WORDS[@]}\")"
+          if [ -n "\$words_var" ]; then
+            local -n words_ref="\$words_var"
+            words_ref=("\${COMP_WORDS[@]}")
+          fi
           [ -n "\$cword_var" ] && printf -v "\$cword_var" '%s' "\$COMP_CWORD"
         }
       fi
@@ -1270,7 +1249,6 @@ write_files:
       INSTALL_CILIUM=${INSTALL_CILIUM}
       GITHUB_USER=${GITHUB_USER}
       SSH_PUBKEY='${SSH_PUBKEY}'
-      HYPERVISOR=${HYPERVISOR}
 # Persistent paths
 bind_mounts:
   - /var/lib/k0s
@@ -1305,16 +1283,7 @@ reset:
 upgrade:
   reboot: true
 
-# Proxmox integration (only when running on Proxmox)
 EOF
-
-    if [ "${HYPERVISOR:-proxmox}" = "proxmox" ]; then
-        cat >> "$OUTPUT_FILE" << 'BUNDLEEOF'
-bundles:
-  - targets:
-      - run://quay.io/kairos/community-bundles:qemu-guest-agent_latest
-BUNDLEEOF
-    fi
 
     print_successful "Controller join cloud-config written to ${OUTPUT_FILE}"
     print_info "Installer target: http://${NODE_IP}:8080"
