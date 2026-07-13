@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.44"
+SCRIPT_VERSION="1.0.46"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -584,7 +584,60 @@ write_files:
     permissions: "0755"
     content: |
       #!/bin/sh
+      version="\$(k0s version 2>/dev/null | head -n 1 | sed 's/+k0s.*//')"
+      if [ -x /var/lib/k0s/bin/kubectl ] && [ -r /var/lib/k0s/bin/kubectl.version ] && [ "\$(cat /var/lib/k0s/bin/kubectl.version)" = "\$version" ]; then
+        exec /var/lib/k0s/bin/kubectl "\$@"
+      fi
       exec k0s kubectl "\$@"
+  - path: /usr/local/sbin/install-kubectl
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      set -u
+
+      version="\$(k0s version 2>/dev/null | head -n 1 | sed 's/+k0s.*//')"
+      case "\$version" in
+        v[0-9]*.[0-9]*.[0-9]*) ;;
+        *) echo "Unable to determine kubectl version from k0s: \$version"; exit 0 ;;
+      esac
+
+      case "\$(uname -m)" in
+        x86_64|amd64) arch=amd64 ;;
+        aarch64|arm64) arch=arm64 ;;
+        *) echo "Unsupported kubectl architecture: \$(uname -m)"; exit 0 ;;
+      esac
+
+      dest=/var/lib/k0s/bin/kubectl
+      marker=\${dest}.version
+      mkdir -p /var/lib/k0s/bin /etc/bash_completion.d
+
+      if [ -x "\$dest" ] && [ -r "\$marker" ] && [ "\$(cat "\$marker")" = "\$version" ]; then
+        "\$dest" completion bash > /etc/bash_completion.d/kubectl 2>/dev/null || true
+        exit 0
+      fi
+
+      rm -f /etc/bash_completion.d/kubectl
+      tmp=/tmp/kubectl.download
+      checksum=/tmp/kubectl.download.sha256
+      trap 'rm -f "\$tmp" "\$checksum"' 0 HUP INT TERM
+      url=https://dl.k8s.io/release/\${version}/bin/linux/\${arch}/kubectl
+
+      if ! curl -fsSL "\$url" -o "\$tmp" || ! curl -fsSL "\${url}.sha256" -o "\$checksum"; then
+        echo "Unable to download kubectl \$version; keeping k0s kubectl fallback."
+        exit 0
+      fi
+
+      expected="\$(tr -d '[:space:]' < "\$checksum")"
+      if [ -z "\$expected" ] || ! printf '%s  %s\n' "\$expected" "\$tmp" | sha256sum -c - >/dev/null 2>&1; then
+        echo "kubectl checksum validation failed; keeping k0s kubectl fallback."
+        exit 0
+      fi
+
+      if install -m 0755 "\$tmp" "\$dest"; then
+        printf '%s\n' "\$version" > "\$marker"
+        "\$dest" completion bash > /etc/bash_completion.d/kubectl 2>/dev/null || true
+        echo "Installed kubectl \$version for shell completion."
+      fi
   - path: /etc/profile.d/k0s-kubeconfig.sh
     permissions: "0644"
     content: |
@@ -594,12 +647,9 @@ write_files:
         for completion in /usr/share/bash-completion/bash_completion /etc/bash_completion; do
           [ -r "\$completion" ] && . "\$completion"
         done
-        for completion in /etc/bash_completion.d/k0s-compat /etc/bash_completion.d/k0s /etc/bash_completion.d/kubectl /etc/bash_completion.d/kubectl-alias; do
+        for completion in /etc/bash_completion.d/k0s-compat /etc/bash_completion.d/k0s /etc/bash_completion.d/kubectl; do
           [ -r "\$completion" ] && source -- "\$completion"
         done
-        if ! type __start_kubectl >/dev/null 2>&1 && command -v k0s >/dev/null 2>&1; then
-          source <(k0s kubectl completion bash 2>/dev/null)
-        fi
         type __start_kubectl >/dev/null 2>&1 && complete -o default -F __start_kubectl kubectl k
       fi
   - path: /root/.bashrc
@@ -699,11 +749,10 @@ stages:
         - mkdir -p /var/lib/k0s/kubelet
     - name: "Configure controller shell defaults"
       commands:
-        - mkdir -p /etc/profile.d /etc/bash_completion.d /usr/local/bin
-        - chmod 0755 /usr/local/bin/kubectl
+        - mkdir -p /etc/profile.d /etc/bash_completion.d /usr/local/bin /usr/local/sbin
+        - chmod 0755 /usr/local/bin/kubectl /usr/local/sbin/install-kubectl
         - k0s completion bash > /etc/bash_completion.d/k0s 2>/dev/null || true
-        - k0s kubectl completion bash > /etc/bash_completion.d/kubectl 2>/dev/null || true
-        - printf "%s\n" "type __start_kubectl >/dev/null 2>&1 && complete -o default -F __start_kubectl kubectl k" > /etc/bash_completion.d/kubectl-alias
+        - /usr/local/sbin/install-kubectl
 
 # Reset behavior — what happens when kairos-agent reset is called
 reset:
@@ -1077,7 +1126,60 @@ write_files:
     permissions: "0755"
     content: |
       #!/bin/sh
+      version="\$(k0s version 2>/dev/null | head -n 1 | sed 's/+k0s.*//')"
+      if [ -x /var/lib/k0s/bin/kubectl ] && [ -r /var/lib/k0s/bin/kubectl.version ] && [ "\$(cat /var/lib/k0s/bin/kubectl.version)" = "\$version" ]; then
+        exec /var/lib/k0s/bin/kubectl "\$@"
+      fi
       exec k0s kubectl "\$@"
+  - path: /usr/local/sbin/install-kubectl
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      set -u
+
+      version="\$(k0s version 2>/dev/null | head -n 1 | sed 's/+k0s.*//')"
+      case "\$version" in
+        v[0-9]*.[0-9]*.[0-9]*) ;;
+        *) echo "Unable to determine kubectl version from k0s: \$version"; exit 0 ;;
+      esac
+
+      case "\$(uname -m)" in
+        x86_64|amd64) arch=amd64 ;;
+        aarch64|arm64) arch=arm64 ;;
+        *) echo "Unsupported kubectl architecture: \$(uname -m)"; exit 0 ;;
+      esac
+
+      dest=/var/lib/k0s/bin/kubectl
+      marker=\${dest}.version
+      mkdir -p /var/lib/k0s/bin /etc/bash_completion.d
+
+      if [ -x "\$dest" ] && [ -r "\$marker" ] && [ "\$(cat "\$marker")" = "\$version" ]; then
+        "\$dest" completion bash > /etc/bash_completion.d/kubectl 2>/dev/null || true
+        exit 0
+      fi
+
+      rm -f /etc/bash_completion.d/kubectl
+      tmp=/tmp/kubectl.download
+      checksum=/tmp/kubectl.download.sha256
+      trap 'rm -f "\$tmp" "\$checksum"' 0 HUP INT TERM
+      url=https://dl.k8s.io/release/\${version}/bin/linux/\${arch}/kubectl
+
+      if ! curl -fsSL "\$url" -o "\$tmp" || ! curl -fsSL "\${url}.sha256" -o "\$checksum"; then
+        echo "Unable to download kubectl \$version; keeping k0s kubectl fallback."
+        exit 0
+      fi
+
+      expected="\$(tr -d '[:space:]' < "\$checksum")"
+      if [ -z "\$expected" ] || ! printf '%s  %s\n' "\$expected" "\$tmp" | sha256sum -c - >/dev/null 2>&1; then
+        echo "kubectl checksum validation failed; keeping k0s kubectl fallback."
+        exit 0
+      fi
+
+      if install -m 0755 "\$tmp" "\$dest"; then
+        printf '%s\n' "\$version" > "\$marker"
+        "\$dest" completion bash > /etc/bash_completion.d/kubectl 2>/dev/null || true
+        echo "Installed kubectl \$version for shell completion."
+      fi
   - path: /etc/profile.d/k0s-kubeconfig.sh
     permissions: "0644"
     content: |
@@ -1087,12 +1189,9 @@ write_files:
         for completion in /usr/share/bash-completion/bash_completion /etc/bash_completion; do
           [ -r "\$completion" ] && . "\$completion"
         done
-        for completion in /etc/bash_completion.d/k0s-compat /etc/bash_completion.d/k0s /etc/bash_completion.d/kubectl /etc/bash_completion.d/kubectl-alias; do
+        for completion in /etc/bash_completion.d/k0s-compat /etc/bash_completion.d/k0s /etc/bash_completion.d/kubectl; do
           [ -r "\$completion" ] && source -- "\$completion"
         done
-        if ! type __start_kubectl >/dev/null 2>&1 && command -v k0s >/dev/null 2>&1; then
-          source <(k0s kubectl completion bash 2>/dev/null)
-        fi
         type __start_kubectl >/dev/null 2>&1 && complete -o default -F __start_kubectl kubectl k
       fi
   - path: /root/.bashrc
@@ -1193,11 +1292,10 @@ stages:
         - mkdir -p /var/lib/k0s/kubelet
     - name: "Configure controller shell defaults"
       commands:
-        - mkdir -p /etc/profile.d /etc/bash_completion.d /usr/local/bin
-        - chmod 0755 /usr/local/bin/kubectl
+        - mkdir -p /etc/profile.d /etc/bash_completion.d /usr/local/bin /usr/local/sbin
+        - chmod 0755 /usr/local/bin/kubectl /usr/local/sbin/install-kubectl
         - k0s completion bash > /etc/bash_completion.d/k0s 2>/dev/null || true
-        - k0s kubectl completion bash > /etc/bash_completion.d/kubectl 2>/dev/null || true
-        - printf "%s\n" "type __start_kubectl >/dev/null 2>&1 && complete -o default -F __start_kubectl kubectl k" > /etc/bash_completion.d/kubectl-alias
+        - /usr/local/sbin/install-kubectl
 
 reset:
   reboot: true
