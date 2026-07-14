@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.51"
+SCRIPT_VERSION="1.0.53"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -1797,14 +1797,30 @@ install_cilium_cli() {
 
 install_cilium() {
     local wait_mode="${1:-wait}"
+    local cilium_api_server_urls="https://${CONTROLLER_IP}:6443"
+    local cilium_version
+    local additional_controller_ip
+
+    for additional_controller_ip in "${ADDITIONAL_CONTROLLERS[@]}"; do
+        [ -n "$additional_controller_ip" ] || continue
+        cilium_api_server_urls+=" https://${additional_controller_ip}:6443"
+    done
 
     print_info "Installing Cilium (k0s kubeconfig: $K0S_KUBECONFIG)..."
     install_cilium_cli
+
+    cilium_version=$(get_latest_cilium_stable_version)
+    if [ -n "$cilium_version" ]; then
+        print_info "Using latest stable Cilium chart: ${cilium_version}"
+    else
+        print_warning "Could not determine the latest stable Cilium chart; using the Cilium CLI default."
+    fi
 
     local install_args=(
         --kubeconfig "$K0S_KUBECONFIG"
         --set k8sServiceHost="${CONTROLLER_IP}"
         --set k8sServicePort=6443
+        --set "k8s.apiServerURLs=${cilium_api_server_urls}"
         --set kubeProxyReplacement=true
         --set tunnelProtocol=geneve
         --set loadBalancer.mode=dsr
@@ -1824,6 +1840,8 @@ install_cilium() {
         --set hubble.ui.enabled=false
         --set bgp.announce.loadbalancerIP=true
     )
+
+    [ -n "$cilium_version" ] && install_args+=(--version "$cilium_version")
 
     [ "$wait_mode" = "skip-wait" ] && install_args+=(--wait=false)
 
