@@ -47,7 +47,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.67"
+SCRIPT_VERSION="1.0.68"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -952,10 +952,17 @@ generate_worker_cloudconfig() {
   grub_options:
     extra_cmdline: \"rd.neednet=1\""
 
-    # Build SSH keys block (github key always, raw key as fallback if provided)
+    # Workers authorize the controller-management public key so controller-side
+    # diagnostics can inspect their local kubelet configuration over SSH.
+    prepare_controller_management_key || true
+
+    # Build SSH keys block (github key, user key, and management public key)
     local SSH_KEYS_BLOCK="      - github:${GITHUB_USER}"
     if [ -n "$SSH_PUBKEY" ]; then
         SSH_KEYS_BLOCK="${SSH_KEYS_BLOCK}"$'\n'"      - ${SSH_PUBKEY}"
+    fi
+    if [ -n "$CONTROLLER_MANAGEMENT_PUBKEY" ]; then
+        SSH_KEYS_BLOCK="${SSH_KEYS_BLOCK}"$'\n'"      - ${CONTROLLER_MANAGEMENT_PUBKEY}"
     fi
 
     # Hash the password — Kairos v4.x needs SHA-512 crypt, not cleartext
@@ -2808,11 +2815,18 @@ ssh_read_kubelet_root_dir() {
     local root_dir_command
     local remote_root_dir
     local candidate_key
+    local remote_status
     local -a ssh_args
 
-    root_dir_command="ps -eo args 2>/dev/null | grep '[k]ubelet' | grep -o -- '--root-dir=[^ ]*' | head -n 1 | cut -d= -f2"
+    SSH_READ_KUBELET_ROOT_ERROR=""
+    root_dir_command="ps -eo args 2>/dev/null | sed -n -e 's/.*--root-dir=\([^ ]*\).*/\1/p' -e 's/.*--kubelet-root-dir=\([^ ]*\).*/\1/p' | head -n 1"
 
-    for candidate_key in "$HOME/.ssh/id_ed25519_kairos" "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_rsa" "$CONTROLLER_MANAGEMENT_KEY_PATH"; do
+    if ! command -v ssh &>/dev/null; then
+        SSH_READ_KUBELET_ROOT_ERROR="ssh is not installed on the controller"
+        return 1
+    fi
+
+    for candidate_key in "$CONTROLLER_MANAGEMENT_KEY_PATH" "$HOME/.ssh/id_ed25519_kairos" "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_rsa"; do
         [ -r "$candidate_key" ] || continue
         ssh_args=(
             -i "$candidate_key"
@@ -2821,25 +2835,30 @@ ssh_read_kubelet_root_dir() {
             -o StrictHostKeyChecking=accept-new
         )
         remote_root_dir=$(ssh "${ssh_args[@]}" "root@${node_ip}" "$root_dir_command" 2>/dev/null)
-        if [ $? -eq 0 ]; then
+        remote_status=$?
+        if [ "$remote_status" -eq 0 ] && [ -n "$remote_root_dir" ]; then
             printf '%s\n' "$remote_root_dir"
             return 0
         fi
     done
 
-    if command -v ssh &>/dev/null; then
-        ssh_args=(
-            -o BatchMode=yes
-            -o ConnectTimeout=5
-            -o StrictHostKeyChecking=accept-new
-        )
-        remote_root_dir=$(ssh "${ssh_args[@]}" "root@${node_ip}" "$root_dir_command" 2>/dev/null)
-        if [ $? -eq 0 ]; then
-            printf '%s\n' "$remote_root_dir"
-            return 0
-        fi
+    ssh_args=(
+        -o BatchMode=yes
+        -o ConnectTimeout=5
+        -o StrictHostKeyChecking=accept-new
+    )
+    remote_root_dir=$(ssh "${ssh_args[@]}" "root@${node_ip}" "$root_dir_command" 2>/dev/null)
+    remote_status=$?
+    if [ "$remote_status" -eq 0 ] && [ -n "$remote_root_dir" ]; then
+        printf '%s\n' "$remote_root_dir"
+        return 0
     fi
 
+    if [ "$remote_status" -eq 0 ]; then
+        SSH_READ_KUBELET_ROOT_ERROR="SSH succeeded, but no kubelet root-dir argument was found"
+    else
+        SSH_READ_KUBELET_ROOT_ERROR="SSH authentication or connectivity failed"
+    fi
     return 1
 }
 
@@ -2882,20 +2901,25 @@ check_kubelet_root_dir_status() {
         node_ip=$(k0s kubectl get node "$node_name" \
             -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null)
         root_dir=""
+        SSH_READ_KUBELET_ROOT_ERROR=""
 
         if [ -n "$node_ip" ] && ip_output_contains_address "$local_addresses" "$node_ip"; then
             local_root_dir=$(ps -eo args 2>/dev/null \
-                | grep '[k]ubelet' \
-                | grep -o -- '--root-dir=[^ ]*' \
-                | head -n 1 \
-                | cut -d= -f2)
+                | sed -n \
+                    -e 's/.*--root-dir=\([^ ]*\).*/\1/p' \
+                    -e 's/.*--kubelet-root-dir=\([^ ]*\).*/\1/p' \
+                | head -n 1)
             root_dir="$local_root_dir"
         elif [ -n "$node_ip" ]; then
             root_dir=$(ssh_read_kubelet_root_dir "$node_ip")
         fi
 
         if [ -z "$root_dir" ]; then
-            print_warning "${node_name} (${node_ip:-IP unknown}): kubelet root directory could not be read"
+            if [ -n "$SSH_READ_KUBELET_ROOT_ERROR" ]; then
+                print_warning "${node_name} (${node_ip}): ${SSH_READ_KUBELET_ROOT_ERROR}"
+            else
+                print_warning "${node_name} (${node_ip:-IP unknown}): kubelet root directory could not be read"
+            fi
         elif [ "$root_dir" = "$KUBELET_ROOT_DIR" ]; then
             print_successful "${node_name} (${node_ip}): ${root_dir}"
         else
