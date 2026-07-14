@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.53"
+SCRIPT_VERSION="1.0.56"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -2259,12 +2259,30 @@ check_script_version() {
             print_successful "✓ Script is up-to-date (v${remote_version})"
         else
             print_warning "✗ Script is OUTDATED! Local: v${SCRIPT_VERSION} → Remote: v${remote_version}"
-            print_info "A reboot will pull the latest version."
+            print_info "Choose 'Update Script Now' to apply it immediately."
         fi
     else
         print_warning "Could not reach GitHub to check latest version."
     fi
     print_info "Source: https://github.com/Kube-Link/k0s_script/blob/master/kairos_k0s_cluster_manager.sh"
+}
+
+update_script_now() {
+    print_info "Updating cluster manager script now..."
+    print_info "The validated download will replace /root/kairos-cluster-manager.sh and keep the previous copy as .old.sh."
+
+    # Reuse the same validated A/B replacement command used during boot.
+    eval "$SAFE_SCRIPT_UPDATE_COMMAND"
+
+    if [ "${updated:-n}" != "y" ]; then
+        print_error "Script update failed or was not completed."
+        print_info "Update log: /var/log/kairos-cluster-manager-update.log"
+        return 1
+    fi
+
+    print_successful "Script update completed."
+    print_info "Restarting the script with the updated version..."
+    exec /root/kairos-cluster-manager.sh
 }
 
 check_cluster_status() {
@@ -2623,9 +2641,10 @@ check_versions() {
         echo "3. Check Cilium Version"
         echo "4. Check FluxCD Version"
         echo "5. Check Script Version"
-        echo "6. List Available Versions"
-        echo "7. Check All Versions"
-        echo "8. Back to Main Menu"
+        echo "6. Update Script Now"
+        echo "7. List Available Versions"
+        echo "8. Check All Versions"
+        echo "9. Back to Main Menu"
         if ! read -p "Enter your choice: " check_choice; then
             echo ""
             print_info "Input closed. Returning to main menu."
@@ -2638,8 +2657,9 @@ check_versions() {
             3) check_cilium_version ;;
             4) check_fluxcd_version ;;
             5) check_script_version ;;
-            6) list_available_versions ;;
-            7)
+            6) update_script_now ;;
+            7) list_available_versions ;;
+            8)
                 check_k0s_version; echo ""
                 check_kairos_version; echo ""
                 check_cilium_version; echo ""
@@ -2648,7 +2668,7 @@ check_versions() {
                 read -p "Would you like to see all available versions? (y/n): " list_choice
                 [ "$list_choice" = "y" ] && list_available_versions
                 ;;
-            8) return 0 ;;
+            9) return 0 ;;
             "") continue ;;
             *) print_error "Invalid option." ;;
         esac
@@ -3247,26 +3267,28 @@ bootstrap_fluxcd() {
 
 manage_cilium() {
     echo -e "${YELLOW}======== Cilium Management ========${NC}"
-    echo "1. Install Cilium"
-    echo "2. Upgrade Cilium"
-    echo "3. Check Cilium Version"
-    echo "4. Check Cilium Status"
-    echo "5. Back to Main Menu"
+    echo "1. Install Cilium (cluster)"
+    echo "2. Upgrade Cilium (cluster)"
+    echo "3. Install Cilium CLI (local only)"
+    echo "4. Check Cilium Version"
+    echo "5. Check Cilium Status"
+    echo "6. Back to Main Menu"
     echo -e "${YELLOW}==================================${NC}"
     read -p "Enter your choice: " cilium_choice
 
     case $cilium_choice in
         1) ensure_config && install_cilium ;;
         2) upgrade_cilium ;;
-        3) check_cilium_version ;;
-        4)
+        3) install_cilium_cli ;;
+        4) check_cilium_version ;;
+        5)
             if command -v cilium &>/dev/null; then
                 cilium status --kubeconfig "$K0S_KUBECONFIG"
             else
-                print_error "Cilium CLI not installed."
+                print_error "Cilium CLI not installed. Choose option 3 first."
             fi
             ;;
-        5) return ;;
+        6) return ;;
         *) print_error "Invalid option. Returning to main menu." ;;
     esac
 }
