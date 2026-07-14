@@ -36,6 +36,7 @@ KAIROS_DOCKERFILE="Dockerfile.kairos"
 K0S_KUBECONFIG="/var/lib/k0s/pki/admin.conf"
 K0S_CONFIG_PATH="/etc/k0s/k0s.yaml"
 K0S_TOKEN_FILE="/etc/k0s/token"
+CONTROLLER_MANAGEMENT_KEY_PATH="${HOME}/.ssh/id_ed25519_k0s_controllers"
 
 # Kairos image defaults
 # TODO: decide on a base image tag strategy (pin to a release or track latest)
@@ -45,7 +46,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.62"
+SCRIPT_VERSION="1.0.64"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -612,10 +613,16 @@ config_url: \"${CONFIG_URL}\""
         fi
     fi
 
-    # Build SSH keys block (github key always, raw key as fallback if provided)
+    # Controllers share a dedicated management key for status and maintenance checks.
+    prepare_controller_management_key || true
+
+    # Build SSH keys block (GitHub/user key plus the controller-management key)
     local SSH_KEYS_BLOCK="      - github:${GITHUB_USER}"
     if [ -n "$SSH_PUBKEY" ]; then
         SSH_KEYS_BLOCK="${SSH_KEYS_BLOCK}"$'\n'"      - ${SSH_PUBKEY}"
+    fi
+    if [ -n "$CONTROLLER_MANAGEMENT_PUBKEY" ]; then
+        SSH_KEYS_BLOCK="${SSH_KEYS_BLOCK}"$'\n'"      - ${CONTROLLER_MANAGEMENT_PUBKEY}"
     fi
 
     # Hash the password — Kairos v4.x needs SHA-512 crypt, not cleartext
@@ -702,6 +709,7 @@ ${CPLB_UNICAST_PEERS}
         scheduler: {}
         telemetry:
           enabled: false
+${CONTROLLER_MANAGEMENT_WRITE_FILES_BLOCK}
   - path: /usr/local/bin/kubectl
     permissions: "0755"
     content: |
@@ -897,6 +905,8 @@ upgrade:
   reboot: true
 
 EOF
+
+    chmod 0600 "$CONTROLLER_CC_FILE" 2>/dev/null || true
 
     print_successful "Controller cloud-config written to $CONTROLLER_CC_FILE"
     print_info "Next: use main menu option 5 -> 1 to send this config to the primary controller installer."
@@ -1176,10 +1186,16 @@ generate_controller_join_cloudconfig() {
   grub_options:
     extra_cmdline: \"rd.neednet=1\""
 
+    # Use the same dedicated management key on every controller.
+    prepare_controller_management_key || true
+
     # Build SSH keys block
     local SSH_KEYS_BLOCK="      - github:${GITHUB_USER}"
     if [ -n "$SSH_PUBKEY" ]; then
         SSH_KEYS_BLOCK="${SSH_KEYS_BLOCK}"$'\n'"      - ${SSH_PUBKEY}"
+    fi
+    if [ -n "$CONTROLLER_MANAGEMENT_PUBKEY" ]; then
+        SSH_KEYS_BLOCK="${SSH_KEYS_BLOCK}"$'\n'"      - ${CONTROLLER_MANAGEMENT_PUBKEY}"
     fi
 
     # Hash the password — Kairos v4.x needs SHA-512 crypt, not cleartext
@@ -1255,6 +1271,7 @@ ${CPLB_UNICAST_PEERS}
         scheduler: {}
         telemetry:
           enabled: false
+${CONTROLLER_MANAGEMENT_WRITE_FILES_BLOCK}
   - path: /usr/local/bin/kubectl
     permissions: "0755"
     content: |
@@ -1449,6 +1466,8 @@ upgrade:
   reboot: true
 
 EOF
+
+    chmod 0600 "$OUTPUT_FILE" 2>/dev/null || true
 
     print_successful "Controller join cloud-config written to ${OUTPUT_FILE}"
     print_info "Installer target: http://${NODE_IP}:8080"
@@ -2435,6 +2454,54 @@ update_script_now() {
     exec /root/kairos-cluster-manager.sh
 }
 
+prepare_controller_management_key() {
+    local key_dir
+    local private_key_b64
+    local public_key_b64
+
+    CONTROLLER_MANAGEMENT_PUBKEY=""
+    CONTROLLER_MANAGEMENT_WRITE_FILES_BLOCK=""
+    key_dir=$(dirname "$CONTROLLER_MANAGEMENT_KEY_PATH")
+
+    if ! command -v ssh-keygen &>/dev/null; then
+        print_warning "ssh-keygen is unavailable; controller-to-controller VIP ownership checks will require SSH agent forwarding."
+        return 1
+    fi
+
+    mkdir -p "$key_dir" || return 1
+    chmod 0700 "$key_dir" 2>/dev/null || true
+
+    if [ ! -s "$CONTROLLER_MANAGEMENT_KEY_PATH" ]; then
+        if ! ssh-keygen -q -t ed25519 \
+            -f "$CONTROLLER_MANAGEMENT_KEY_PATH" \
+            -N "" \
+            -C "${CLUSTER_NAME:-k0s}-controller-management"; then
+            print_warning "Could not generate the controller-management SSH key."
+            return 1
+        fi
+        print_successful "Generated dedicated controller-management SSH key: $CONTROLLER_MANAGEMENT_KEY_PATH"
+    fi
+
+    if [ ! -s "${CONTROLLER_MANAGEMENT_KEY_PATH}.pub" ]; then
+        ssh-keygen -y -f "$CONTROLLER_MANAGEMENT_KEY_PATH" > "${CONTROLLER_MANAGEMENT_KEY_PATH}.pub" || return 1
+    fi
+
+    chmod 0600 "$CONTROLLER_MANAGEMENT_KEY_PATH" 2>/dev/null || true
+    chmod 0644 "${CONTROLLER_MANAGEMENT_KEY_PATH}.pub" 2>/dev/null || true
+
+    CONTROLLER_MANAGEMENT_PUBKEY=$(cat "${CONTROLLER_MANAGEMENT_KEY_PATH}.pub")
+    private_key_b64=$(script_base64_lf "$CONTROLLER_MANAGEMENT_KEY_PATH")
+    public_key_b64=$(script_base64_lf "${CONTROLLER_MANAGEMENT_KEY_PATH}.pub")
+    CONTROLLER_MANAGEMENT_WRITE_FILES_BLOCK="  - path: /root/.ssh/id_ed25519_k0s_controllers
+    permissions: \"0600\"
+    encoding: b64
+    content: ${private_key_b64}
+  - path: /root/.ssh/id_ed25519_k0s_controllers.pub
+    permissions: \"0644\"
+    encoding: b64
+    content: ${public_key_b64}"
+}
+
 ip_output_contains_address() {
     local address_output="$1"
     local target_ip="$2"
@@ -2522,7 +2589,7 @@ check_control_plane_vip_status() {
         done
     fi
 
-    for candidate_key in "$HOME/.ssh/id_ed25519_kairos" "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_rsa"; do
+    for candidate_key in "$CONTROLLER_MANAGEMENT_KEY_PATH" "$HOME/.ssh/id_ed25519_kairos" "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_rsa"; do
         if [ -r "$candidate_key" ]; then
             identity_file="$candidate_key"
             break
@@ -2581,6 +2648,154 @@ check_control_plane_vip_status() {
         else
             print_info "VIP ownership unavailable for ${unavailable_count} controller(s); API readiness remains the primary health check."
         fi
+    fi
+    echo ""
+}
+
+check_nllb_status() {
+    local nllb_pods_output
+    local nllb_ready_output
+    local expected_count
+    local ready_count
+    local controller_endpoints
+    local worker_nodes
+    local worker_node
+    local proxy_health
+
+    print_info "Node-local load balancing (NLLB):"
+    if k0s_config_section_enabled "nodeLocalLoadBalancing"; then
+        print_successful "Configuration: enabled (EnvoyProxy)"
+    else
+        print_warning "NLLB is not enabled in the local k0s configuration."
+    fi
+
+    controller_endpoints=$(k0s kubectl -n default get endpointslices \
+        -l kubernetes.io/service-name=kubernetes -o wide 2>&1)
+    if [ $? -eq 0 ]; then
+        print_info "Controller API endpoints available to NLLB:"
+        echo "$controller_endpoints"
+    else
+        print_warning "Could not read the Kubernetes controller endpoints:"
+        echo "$controller_endpoints"
+    fi
+
+    nllb_pods_output=$(k0s kubectl -n kube-system get pods \
+        -l app.kubernetes.io/managed-by=k0s,app.kubernetes.io/component=nllb \
+        -o wide 2>&1)
+    if [ $? -eq 0 ]; then
+        echo "$nllb_pods_output"
+    else
+        print_warning "Could not list NLLB pods:"
+        echo "$nllb_pods_output"
+        echo ""
+        return 1
+    fi
+
+    expected_count=$(k0s kubectl get nodes --no-headers 2>/dev/null | awk 'NF { count++ } END { print count + 0 }')
+    nllb_ready_output=$(k0s kubectl -n kube-system get pods \
+        -l app.kubernetes.io/managed-by=k0s,app.kubernetes.io/component=nllb \
+        -o 'custom-columns=NAME:.metadata.name,READY:.status.containerStatuses[0].ready,PHASE:.status.phase' \
+        --no-headers 2>/dev/null)
+    ready_count=$(printf '%s\n' "$nllb_ready_output" | awk '$2 == "true" && $3 == "Running" { count++ } END { print count + 0 }')
+
+    if [ "$expected_count" -gt 0 ] && [ "$ready_count" -eq "$expected_count" ]; then
+        print_successful "NLLB pods ready: ${ready_count}/${expected_count} (one per worker node)"
+    else
+        print_warning "NLLB pods ready: ${ready_count}/${expected_count} expected worker nodes"
+    fi
+
+    print_info "Worker proxy path health (API server -> Konnectivity/NLLB -> kubelet):"
+    worker_nodes=$(k0s kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)
+    if [ -z "$worker_nodes" ]; then
+        print_info "No worker nodes are registered yet."
+    else
+        while IFS= read -r worker_node; do
+            [ -n "$worker_node" ] || continue
+            proxy_health=$(k0s kubectl --request-timeout=5s \
+                get --raw="/api/v1/nodes/${worker_node}/proxy/healthz" 2>&1)
+            if [ $? -eq 0 ] && [ "$proxy_health" = "ok" ]; then
+                print_successful "${worker_node}: proxy health ok"
+            else
+                print_warning "${worker_node}: proxy health failed"
+                echo "  $proxy_health"
+            fi
+        done <<< "$worker_nodes"
+    fi
+    echo ""
+}
+
+check_cilium_connection_point() {
+    local expected_host="${CONTROL_PLANE_VIP_CIDR%/*}"
+    local expected_port="6443"
+    local expected_url="https://${expected_host}:${expected_port}"
+    local daemonset_hosts
+    local daemonset_ports
+    local operator_hosts
+    local operator_ports
+    local configured_urls
+    local connection_mismatch="false"
+
+    print_info "Cilium Kubernetes API connection point:"
+    if ! k0s kubectl -n kube-system get daemonset cilium &>/dev/null; then
+        print_info "Cilium is not installed yet."
+        echo ""
+        return 0
+    fi
+
+    print_info "Expected control-plane VIP: ${expected_url}"
+
+    daemonset_hosts=$(k0s kubectl -n kube-system get daemonset cilium \
+        -o 'jsonpath={.spec.template.spec.containers[*].env[?(@.name=="KUBERNETES_SERVICE_HOST")].value}' \
+        2>/dev/null | tr ' ' '\n' | awk 'NF && !seen[$0]++ { if (value) value=value ","; value=value $0 } END { print value }')
+    daemonset_ports=$(k0s kubectl -n kube-system get daemonset cilium \
+        -o 'jsonpath={.spec.template.spec.containers[*].env[?(@.name=="KUBERNETES_SERVICE_PORT")].value}' \
+        2>/dev/null | tr ' ' '\n' | awk 'NF && !seen[$0]++ { if (value) value=value ","; value=value $0 } END { print value }')
+
+    if [ -n "$daemonset_hosts" ] && [ -n "$daemonset_ports" ]; then
+        echo "Cilium agents: ${daemonset_hosts}:${daemonset_ports}"
+        if [ "$daemonset_hosts" != "$expected_host" ] || [ "$daemonset_ports" != "$expected_port" ]; then
+            connection_mismatch="true"
+        fi
+    else
+        print_warning "Could not read the Kubernetes API endpoint from the Cilium DaemonSet."
+        connection_mismatch="true"
+    fi
+
+    if k0s kubectl -n kube-system get deployment cilium-operator &>/dev/null; then
+        operator_hosts=$(k0s kubectl -n kube-system get deployment cilium-operator \
+            -o 'jsonpath={.spec.template.spec.containers[*].env[?(@.name=="KUBERNETES_SERVICE_HOST")].value}' \
+            2>/dev/null | tr ' ' '\n' | awk 'NF && !seen[$0]++ { if (value) value=value ","; value=value $0 } END { print value }')
+        operator_ports=$(k0s kubectl -n kube-system get deployment cilium-operator \
+            -o 'jsonpath={.spec.template.spec.containers[*].env[?(@.name=="KUBERNETES_SERVICE_PORT")].value}' \
+            2>/dev/null | tr ' ' '\n' | awk 'NF && !seen[$0]++ { if (value) value=value ","; value=value $0 } END { print value }')
+
+        if [ -n "$operator_hosts" ] && [ -n "$operator_ports" ]; then
+            echo "Cilium operator: ${operator_hosts}:${operator_ports}"
+            if [ "$operator_hosts" != "$expected_host" ] || [ "$operator_ports" != "$expected_port" ]; then
+                connection_mismatch="true"
+            fi
+        else
+            print_warning "Could not read the Kubernetes API endpoint from the Cilium operator."
+            connection_mismatch="true"
+        fi
+    fi
+
+    configured_urls=$(k0s kubectl -n kube-system get configmap cilium-config \
+        -o 'jsonpath={.data.k8s-api-server-urls}' 2>/dev/null)
+    if [ -n "$configured_urls" ]; then
+        echo "Cilium config: ${configured_urls}"
+        if [ "$configured_urls" != "$expected_url" ]; then
+            connection_mismatch="true"
+        fi
+    else
+        print_warning "Cilium config does not expose k8s-api-server-urls."
+        connection_mismatch="true"
+    fi
+
+    if [ "$connection_mismatch" = "false" ]; then
+        print_successful "Cilium is using the configured control-plane VIP."
+    else
+        print_warning "Cilium's live Kubernetes API connection point does not fully match ${expected_url}."
     fi
     echo ""
 }
@@ -2664,6 +2879,8 @@ check_cluster_status() {
     fi
     echo ""
 
+    check_nllb_status
+
     print_info "k0s kubectl get node:"
     local nodes_compact_output
     nodes_compact_output=$(k0s kubectl get node 2>&1)
@@ -2702,6 +2919,8 @@ check_cluster_status() {
     fi
 
     echo ""
+    check_cilium_connection_point
+
     if command -v cilium &>/dev/null; then
         print_info "Cilium status:"
         cilium status --kubeconfig "$K0S_KUBECONFIG" 2>/dev/null || print_info "Cilium CLI found but unable to get status."
