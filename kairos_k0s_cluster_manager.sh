@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.58"
+SCRIPT_VERSION="1.0.59"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -2435,6 +2435,148 @@ update_script_now() {
     exec /root/kairos-cluster-manager.sh
 }
 
+ip_output_contains_address() {
+    local address_output="$1"
+    local target_ip="$2"
+
+    printf '%s\n' "$address_output" | awk -v target="$target_ip" '
+        {
+            split($4, address, "/")
+            if (address[1] == target) {
+                found = 1
+            }
+        }
+        END { exit found ? 0 : 1 }
+    '
+}
+
+k0s_config_section_enabled() {
+    local section="$1"
+
+    awk -v section="$section" '
+        index($0, section ":") {
+            getline
+            if ($0 ~ /^[[:space:]]*enabled:[[:space:]]*true[[:space:]]*$/) {
+                found = 1
+            }
+            exit
+        }
+        END { exit found ? 0 : 1 }
+    ' "$K0S_CONFIG_PATH"
+}
+
+check_control_plane_vip_status() {
+    local vip_cidr="${CONTROL_PLANE_VIP_CIDR:-}"
+    local vip_ip="${vip_cidr%/*}"
+    local configured_controllers=("$CONTROLLER_IP" "${ADDITIONAL_CONTROLLERS[@]}")
+    local local_address_output=""
+    local local_controller_ip=""
+    local controller_ip
+    local controller_index=1
+    local owner_count=0
+    local checked_count=0
+    local unavailable_count=0
+    local owner_list=()
+    local remote_address_output
+    local remote_status
+    local identity_file=""
+    local candidate_key
+    local vip_api_output
+
+    print_info "Control-plane VIP / load balancing:"
+    echo "Configured VIP: ${vip_cidr}"
+    echo "VRRP router ID: ${CPLB_VIRTUAL_ROUTER_ID}"
+
+    if [ -r "$K0S_CONFIG_PATH" ]; then
+        if k0s_config_section_enabled "controlPlaneLoadBalancing" && \
+           k0s_config_section_enabled "nodeLocalLoadBalancing" && \
+           grep -Fq -- "- ${vip_cidr}" "$K0S_CONFIG_PATH" && \
+           ! grep -Eq '^[[:space:]]*externalAddress:' "$K0S_CONFIG_PATH"; then
+            print_successful "Local k0s config: CPLB enabled, NLLB enabled, VIP configured, externalAddress unset"
+        else
+            print_warning "Local k0s config does not contain the complete expected CPLB/NLLB configuration."
+        fi
+    else
+        print_warning "Local k0s config not readable: $K0S_CONFIG_PATH"
+    fi
+
+    vip_api_output=$(k0s kubectl \
+        --server="https://${vip_ip}:6443" \
+        --request-timeout=5s get --raw=/readyz 2>&1)
+    if [ $? -eq 0 ]; then
+        vip_api_output=$(printf '%s' "$vip_api_output" | tr '\n' ' ')
+        print_successful "VIP API ready${vip_api_output:+ (${vip_api_output})}"
+    else
+        print_warning "VIP API check failed for https://${vip_ip}:6443"
+        echo "  $vip_api_output"
+    fi
+
+    if command -v ip &>/dev/null; then
+        local_address_output=$(ip -4 -o addr show 2>/dev/null)
+        for controller_ip in "${configured_controllers[@]}"; do
+            if ip_output_contains_address "$local_address_output" "$controller_ip"; then
+                local_controller_ip="$controller_ip"
+                break
+            fi
+        done
+    fi
+
+    for candidate_key in "$HOME/.ssh/id_ed25519_kairos" "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_rsa"; do
+        if [ -r "$candidate_key" ]; then
+            identity_file="$candidate_key"
+            break
+        fi
+    done
+
+    for controller_ip in "${configured_controllers[@]}"; do
+        [ -n "$controller_ip" ] || continue
+
+        if [ "$controller_ip" = "$local_controller_ip" ]; then
+            checked_count=$((checked_count + 1))
+            if ip_output_contains_address "$local_address_output" "$vip_ip"; then
+                owner_list+=("${CLUSTER_NAME}-ctrl-${controller_index} (${controller_ip})")
+                owner_count=$((owner_count + 1))
+            fi
+        elif command -v ssh &>/dev/null && [ -n "$identity_file" ]; then
+            remote_address_output=$(ssh \
+                -i "$identity_file" \
+                -o BatchMode=yes \
+                -o ConnectTimeout=5 \
+                -o StrictHostKeyChecking=accept-new \
+                "root@${controller_ip}" \
+                "ip -4 -o addr show 2>/dev/null" 2>/dev/null)
+            remote_status=$?
+            if [ "$remote_status" -eq 0 ]; then
+                checked_count=$((checked_count + 1))
+                if ip_output_contains_address "$remote_address_output" "$vip_ip"; then
+                    owner_list+=("${CLUSTER_NAME}-ctrl-${controller_index} (${controller_ip})")
+                    owner_count=$((owner_count + 1))
+                fi
+            else
+                unavailable_count=$((unavailable_count + 1))
+            fi
+        else
+            unavailable_count=$((unavailable_count + 1))
+        fi
+        controller_index=$((controller_index + 1))
+    done
+
+    if [ "$owner_count" -eq 1 ]; then
+        print_successful "Current VIP owner: ${owner_list[0]}"
+    elif [ "$owner_count" -gt 1 ]; then
+        print_warning "Multiple controllers report owning the VIP: ${owner_list[*]}"
+    elif [ "$checked_count" -gt 0 ]; then
+        print_warning "No checked controller currently owns the configured VIP."
+    else
+        print_warning "VIP ownership could not be checked locally or over SSH."
+    fi
+
+    if [ "$unavailable_count" -gt 0 ]; then
+        print_info "VIP ownership unavailable for ${unavailable_count} controller(s); API readiness remains the primary health check."
+    fi
+    echo ""
+}
+
 check_cluster_status() {
     print_info "Checking cluster status (local)..."
 
@@ -2446,6 +2588,8 @@ check_cluster_status() {
     print_info "k0s status:"
     k0s status 2>/dev/null || print_warning "Unable to read k0s status."
     echo ""
+
+    check_control_plane_vip_status
 
     print_info "Configured controllers:"
     local configured_controllers=("$CONTROLLER_IP" "${ADDITIONAL_CONTROLLERS[@]}")
