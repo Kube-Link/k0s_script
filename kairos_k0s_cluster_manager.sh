@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.57"
+SCRIPT_VERSION="1.0.58"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -216,11 +216,47 @@ validate_unique_nodes() {
         [ -z "$node" ] && continue
         for existing in "${seen[@]}"; do
             if [ "$node" = "$existing" ]; then
-                print_error "Duplicate node IP in config: $node"
+                print_error "Duplicate IP in config: $node"
                 return 1
             fi
         done
         seen+=("$node")
+    done
+}
+
+is_ipv4_address() {
+    local ip="$1"
+    local octet
+    local -a octets
+
+    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    IFS='.' read -ra octets <<< "$ip"
+    for octet in "${octets[@]}"; do
+        [ "$((10#$octet))" -le 255 ] || return 1
+    done
+}
+
+is_ipv4_cidr() {
+    local cidr="$1"
+    local address="${cidr%/*}"
+    local prefix="${cidr##*/}"
+
+    [ "$address" != "$cidr" ] || return 1
+    is_ipv4_address "$address" || return 1
+    [[ "$prefix" =~ ^[0-9]+$ ]] || return 1
+    [ "$((10#$prefix))" -ge 1 ] && [ "$((10#$prefix))" -le 32 ]
+}
+
+build_yaml_ip_list() {
+    local indentation="$1"
+    local excluded_ip="$2"
+    shift 2
+    local ip
+
+    for ip in "$@"; do
+        [ -n "$ip" ] || continue
+        [ "$ip" = "$excluded_ip" ] && continue
+        printf '%*s- %s\n' "$indentation" '' "$ip"
     done
 }
 
@@ -250,12 +286,21 @@ validate_config_file() {
     validation_output=$(bash -c '
         source "$1" || exit 1
         failed=0
-        for key in CONTROLLER_COUNT CONTROLLER_WORKER CONTROLLER_IP ADDITIONAL_CONTROLLERS WORKERS CLUSTER_NAME POD_CIDR SERVICE_CIDR INSTALL_CILIUM GITHUB_USER SSH_PUBKEY; do
+        for key in CONTROLLER_COUNT CONTROLLER_WORKER CONTROLLER_IP ADDITIONAL_CONTROLLERS WORKERS CLUSTER_NAME CONTROL_PLANE_VIP_CIDR CPLB_AUTH_PASS CPLB_VIRTUAL_ROUTER_ID POD_CIDR SERVICE_CIDR INSTALL_CILIUM GITHUB_USER SSH_PUBKEY; do
             if ! declare -p "$key" >/dev/null 2>&1; then
                 echo "Missing required config key: $key"
                 failed=1
             fi
         done
+        valid_ipv4() {
+            local ip="$1" octet
+            local -a octets
+            [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+            IFS=. read -ra octets <<< "$ip"
+            for octet in "${octets[@]}"; do
+                [ "$((10#$octet))" -le 255 ] || return 1
+            done
+        }
         case "${CONTROLLER_WORKER:-}" in
             y|n) ;;
             *) echo "CONTROLLER_WORKER must be y or n."; failed=1 ;;
@@ -270,6 +315,30 @@ validate_config_file() {
         fi
         if [ "${CONTROLLER_WORKER:-n}" = "n" ] && [ "${#WORKERS[@]}" -eq 0 ]; then
             echo "At least one worker IP is required when controllers are controller-only."
+            failed=1
+        fi
+        vip_cidr="${CONTROL_PLANE_VIP_CIDR:-}"
+        vip_ip="${vip_cidr%/*}"
+        vip_prefix="${vip_cidr##*/}"
+        if [ "$vip_ip" = "$vip_cidr" ] || ! valid_ipv4 "$vip_ip" || ! [[ "$vip_prefix" =~ ^[0-9]+$ ]] || [ "$((10#${vip_prefix:-0}))" -lt 1 ] || [ "$((10#${vip_prefix:-0}))" -gt 32 ]; then
+            echo "CONTROL_PLANE_VIP_CIDR must be a valid IPv4 CIDR, for example 172.20.1.10/24."
+            failed=1
+        fi
+        for ip in "${CONTROLLER_IP:-}" "${ADDITIONAL_CONTROLLERS[@]}" "${WORKERS[@]}"; do
+            if ! valid_ipv4 "$ip"; then
+                echo "Invalid node IPv4 address: $ip"
+                failed=1
+            elif [ -n "$vip_ip" ] && [ "$vip_ip" = "$ip" ]; then
+                echo "The control-plane VIP must not match a controller or worker IP: $vip_ip"
+                failed=1
+            fi
+        done
+        if ! [[ "${CPLB_AUTH_PASS:-}" =~ ^[A-Za-z0-9_-]{1,8}$ ]]; then
+            echo "CPLB_AUTH_PASS must contain 1-8 letters, numbers, underscores, or hyphens."
+            failed=1
+        fi
+        if ! [[ "${CPLB_VIRTUAL_ROUTER_ID:-}" =~ ^[0-9]+$ ]] || [ "$((10#${CPLB_VIRTUAL_ROUTER_ID:-0}))" -lt 1 ] || [ "$((10#${CPLB_VIRTUAL_ROUTER_ID:-0}))" -gt 255 ]; then
+            echo "CPLB_VIRTUAL_ROUTER_ID must be between 1 and 255."
             failed=1
         fi
         exit "$failed"
@@ -341,11 +410,46 @@ generate_config_file() {
         fi
     fi
 
-    validate_unique_nodes "$CONTROLLER_IP" "${ADDITIONAL_CONTROLLERS[@]}" "${WORKERS[@]}" || return 1
+    for item in "$CONTROLLER_IP" "${ADDITIONAL_CONTROLLERS[@]}" "${WORKERS[@]}"; do
+        if ! is_ipv4_address "$item"; then
+            print_error "Invalid node IPv4 address: $item"
+            return 1
+        fi
+    done
 
     read -p "Enter cluster name (default: $DEFAULT_CLUSTER_NAME): " CLUSTER_NAME || return 1
     CLUSTER_NAME=${CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}
     CLUSTER_NAME=$(trim_value "$CLUSTER_NAME")
+
+    print_info "The control-plane VIP must be unused and routable on the controller network."
+    read -p "Enter control-plane VIP with CIDR (example: 172.20.1.10/24): " CONTROL_PLANE_VIP_CIDR || return 1
+    CONTROL_PLANE_VIP_CIDR=$(trim_value "$CONTROL_PLANE_VIP_CIDR")
+    if ! is_ipv4_cidr "$CONTROL_PLANE_VIP_CIDR"; then
+        print_error "A valid IPv4 VIP with CIDR is required, for example 172.20.1.10/24."
+        return 1
+    fi
+
+    local control_plane_vip_ip="${CONTROL_PLANE_VIP_CIDR%/*}"
+    validate_unique_nodes "$CONTROLLER_IP" "${ADDITIONAL_CONTROLLERS[@]}" "${WORKERS[@]}" "$control_plane_vip_ip" || return 1
+
+    local default_cplb_auth="${CLUSTER_NAME//[^[:alnum:]_-]/}"
+    default_cplb_auth="${default_cplb_auth:0:8}"
+    [ -n "$default_cplb_auth" ] || default_cplb_auth="k0scplb"
+    read -p "Enter CPLB auth password (1-8 letters/numbers/_/-, default: ${default_cplb_auth}): " CPLB_AUTH_PASS || return 1
+    CPLB_AUTH_PASS=${CPLB_AUTH_PASS:-$default_cplb_auth}
+    CPLB_AUTH_PASS=$(trim_value "$CPLB_AUTH_PASS")
+    if ! [[ "$CPLB_AUTH_PASS" =~ ^[A-Za-z0-9_-]{1,8}$ ]]; then
+        print_error "CPLB auth password must contain 1-8 letters, numbers, underscores, or hyphens."
+        return 1
+    fi
+
+    read -p "Enter CPLB virtual router ID (default: 51): " CPLB_VIRTUAL_ROUTER_ID || return 1
+    CPLB_VIRTUAL_ROUTER_ID=${CPLB_VIRTUAL_ROUTER_ID:-51}
+    CPLB_VIRTUAL_ROUTER_ID=$(trim_value "$CPLB_VIRTUAL_ROUTER_ID")
+    if ! [[ "$CPLB_VIRTUAL_ROUTER_ID" =~ ^[0-9]+$ ]] || [ "$((10#$CPLB_VIRTUAL_ROUTER_ID))" -lt 1 ] || [ "$((10#$CPLB_VIRTUAL_ROUTER_ID))" -gt 255 ]; then
+        print_error "CPLB virtual router ID must be between 1 and 255."
+        return 1
+    fi
 
     read -p "Enter Pod CIDR (default: $DEFAULT_POD_CIDR): " POD_CIDR || return 1
     POD_CIDR=${POD_CIDR:-$DEFAULT_POD_CIDR}
@@ -415,6 +519,9 @@ generate_config_file() {
     write_config_array "$tmp_config" "ADDITIONAL_CONTROLLERS" "${ADDITIONAL_CONTROLLERS[@]}"
     write_config_array "$tmp_config" "WORKERS" "${WORKERS[@]}"
     write_config_value "$tmp_config" "CLUSTER_NAME" "$CLUSTER_NAME"
+    write_config_value "$tmp_config" "CONTROL_PLANE_VIP_CIDR" "$CONTROL_PLANE_VIP_CIDR"
+    write_config_value "$tmp_config" "CPLB_AUTH_PASS" "$CPLB_AUTH_PASS"
+    write_config_value "$tmp_config" "CPLB_VIRTUAL_ROUTER_ID" "$CPLB_VIRTUAL_ROUTER_ID"
     write_config_value "$tmp_config" "POD_CIDR" "$POD_CIDR"
     write_config_value "$tmp_config" "SERVICE_CIDR" "$SERVICE_CIDR"
     write_config_value "$tmp_config" "INSTALL_CILIUM" "$INSTALL_CILIUM"
@@ -517,6 +624,12 @@ config_url: \"${CONFIG_URL}\""
 
     local CTRL_HOSTNAME="${CLUSTER_NAME}-ctrl-1"
 
+    local CONTROL_PLANE_VIP_IP="${CONTROL_PLANE_VIP_CIDR%/*}"
+    local CONTROLLER_API_SANS
+    local CPLB_UNICAST_PEERS
+    CONTROLLER_API_SANS=$(build_yaml_ip_list 12 "" "$CONTROLLER_IP" "${ADDITIONAL_CONTROLLERS[@]}" "$CONTROL_PLANE_VIP_IP")
+    CPLB_UNICAST_PEERS=$(build_yaml_ip_list 20 "$CONTROLLER_IP" "$CONTROLLER_IP" "${ADDITIONAL_CONTROLLERS[@]}")
+
     local K0S_ARGS
     K0S_ARGS=$(build_controller_k0s_args false)
 
@@ -557,16 +670,30 @@ write_files:
       spec:
         api:
           address: ${CONTROLLER_IP}
-          externalAddress: ${CONTROLLER_IP}
           port: 6443
           sans:
-            - ${CONTROLLER_IP}
+${CONTROLLER_API_SANS}
         network:
           provider: custom
           podCIDR: ${POD_CIDR}
           serviceCIDR: ${SERVICE_CIDR}
           kubeProxy:
             disabled: true
+          controlPlaneLoadBalancing:
+            enabled: true
+            type: Keepalived
+            keepalived:
+              vrrpInstances:
+                - virtualIPs:
+                    - ${CONTROL_PLANE_VIP_CIDR}
+                  authPass: "${CPLB_AUTH_PASS}"
+                  virtualRouterID: ${CPLB_VIRTUAL_ROUTER_ID}
+                  unicastSourceIP: ${CONTROLLER_IP}
+                  unicastPeers:
+${CPLB_UNICAST_PEERS}
+          nodeLocalLoadBalancing:
+            enabled: true
+            type: EnvoyProxy
         storage:
           type: etcd
           etcd:
@@ -722,6 +849,9 @@ write_files:
       ADDITIONAL_CONTROLLERS=(${ADDITIONAL_CONTROLLERS[@]})
       WORKERS=(${WORKERS[@]})
       CLUSTER_NAME=${CLUSTER_NAME}
+      CONTROL_PLANE_VIP_CIDR=${CONTROL_PLANE_VIP_CIDR}
+      CPLB_AUTH_PASS=${CPLB_AUTH_PASS}
+      CPLB_VIRTUAL_ROUTER_ID=${CPLB_VIRTUAL_ROUTER_ID}
       POD_CIDR=${POD_CIDR}
       SERVICE_CIDR=${SERVICE_CIDR}
       INSTALL_CILIUM=${INSTALL_CILIUM}
@@ -863,6 +993,9 @@ write_files:
       ADDITIONAL_CONTROLLERS=(${ADDITIONAL_CONTROLLERS[@]})
       WORKERS=(${WORKERS[@]})
       CLUSTER_NAME=${CLUSTER_NAME}
+      CONTROL_PLANE_VIP_CIDR=${CONTROL_PLANE_VIP_CIDR}
+      CPLB_AUTH_PASS=${CPLB_AUTH_PASS}
+      CPLB_VIRTUAL_ROUTER_ID=${CPLB_VIRTUAL_ROUTER_ID}
       POD_CIDR=${POD_CIDR}
       SERVICE_CIDR=${SERVICE_CIDR}
       INSTALL_CILIUM=${INSTALL_CILIUM}
@@ -1022,6 +1155,12 @@ generate_controller_join_cloudconfig() {
 
     local OUTPUT_FILE="controller-join-cloud-config-${NODE_INDEX}.yaml"
 
+    local CONTROL_PLANE_VIP_IP="${CONTROL_PLANE_VIP_CIDR%/*}"
+    local CONTROLLER_API_SANS
+    local CPLB_UNICAST_PEERS
+    CONTROLLER_API_SANS=$(build_yaml_ip_list 12 "" "$CONTROLLER_IP" "${ADDITIONAL_CONTROLLERS[@]}" "$CONTROL_PLANE_VIP_IP")
+    CPLB_UNICAST_PEERS=$(build_yaml_ip_list 20 "$NODE_IP" "$CONTROLLER_IP" "${ADDITIONAL_CONTROLLERS[@]}")
+
     local K0S_ARGS
     K0S_ARGS=$(build_controller_k0s_args true)
 
@@ -1084,17 +1223,30 @@ write_files:
       spec:
         api:
           address: ${NODE_IP}
-          externalAddress: ${NODE_IP}
           port: 6443
           sans:
-            - ${CONTROLLER_IP}
-            - ${NODE_IP}
+${CONTROLLER_API_SANS}
         network:
           provider: custom
           podCIDR: ${POD_CIDR}
           serviceCIDR: ${SERVICE_CIDR}
           kubeProxy:
             disabled: true
+          controlPlaneLoadBalancing:
+            enabled: true
+            type: Keepalived
+            keepalived:
+              vrrpInstances:
+                - virtualIPs:
+                    - ${CONTROL_PLANE_VIP_CIDR}
+                  authPass: "${CPLB_AUTH_PASS}"
+                  virtualRouterID: ${CPLB_VIRTUAL_ROUTER_ID}
+                  unicastSourceIP: ${NODE_IP}
+                  unicastPeers:
+${CPLB_UNICAST_PEERS}
+          nodeLocalLoadBalancing:
+            enabled: true
+            type: EnvoyProxy
         storage:
           type: etcd
           etcd:
@@ -1254,6 +1406,9 @@ write_files:
       ADDITIONAL_CONTROLLERS=(${ADDITIONAL_CONTROLLERS[@]})
       WORKERS=(${WORKERS[@]})
       CLUSTER_NAME=${CLUSTER_NAME}
+      CONTROL_PLANE_VIP_CIDR=${CONTROL_PLANE_VIP_CIDR}
+      CPLB_AUTH_PASS=${CPLB_AUTH_PASS}
+      CPLB_VIRTUAL_ROUTER_ID=${CPLB_VIRTUAL_ROUTER_ID}
       POD_CIDR=${POD_CIDR}
       SERVICE_CIDR=${SERVICE_CIDR}
       INSTALL_CILIUM=${INSTALL_CILIUM}
@@ -1797,14 +1952,9 @@ install_cilium_cli() {
 
 install_cilium() {
     local wait_mode="${1:-wait}"
-    local cilium_api_server_urls="https://${CONTROLLER_IP}:6443"
+    local control_plane_vip_ip="${CONTROL_PLANE_VIP_CIDR%/*}"
+    local cilium_api_server_urls="https://${control_plane_vip_ip}:6443"
     local cilium_version
-    local additional_controller_ip
-
-    for additional_controller_ip in "${ADDITIONAL_CONTROLLERS[@]}"; do
-        [ -n "$additional_controller_ip" ] || continue
-        cilium_api_server_urls+=" https://${additional_controller_ip}:6443"
-    done
 
     print_info "Installing Cilium (k0s kubeconfig: $K0S_KUBECONFIG)..."
     install_cilium_cli
@@ -1818,9 +1968,9 @@ install_cilium() {
 
     local install_args=(
         --kubeconfig "$K0S_KUBECONFIG"
-        --set k8sServiceHost="${CONTROLLER_IP}"
+        --set k8sServiceHost="${control_plane_vip_ip}"
         --set k8sServicePort=6443
-        --set "k8s.apiServerURLs=${cilium_api_server_urls}"
+        --set k8s.apiServerURLs="${cilium_api_server_urls}"
         --set kubeProxyReplacement=true
         --set tunnelProtocol=geneve
         --set loadBalancer.mode=dsr
@@ -1845,7 +1995,7 @@ install_cilium() {
 
     [ "$wait_mode" = "skip-wait" ] && install_args+=(--wait=false)
 
-    # NOTE: k8sServiceHost points to the controller; k0s API port is 6443
+    # Cilium uses the highly available control-plane VIP rather than one controller.
     if ! cilium install "${install_args[@]}"; then
         print_error "Cilium install failed."
         return 1
@@ -3818,7 +3968,7 @@ setup_ssh_keys() {
 # -----------------------------------------------------------------------------
 while true; do
     echo -e "\n${YELLOW}======== Kairos + k0s Cluster Management (v${SCRIPT_VERSION}) ========${NC}"
-    echo "1.  Generate Config File (cluster settings)"
+    echo "1.  Generate Config File (cluster settings + HA VIP)"
     echo "2.  Generate Controller Cloud-Config (first controller)"
     echo "3.  Generate Controller Join Token + Cloud-Config (additional controllers)"
     echo "4.  Generate Worker Token + Cloud-Config (worker nodes)"
