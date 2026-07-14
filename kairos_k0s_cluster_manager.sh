@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.50"
+SCRIPT_VERSION="1.0.51"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -2265,7 +2265,8 @@ check_cluster_status() {
     local configured_controllers=("$CONTROLLER_IP" "${ADDITIONAL_CONTROLLERS[@]}")
     local controller_index=1
     local controller_ip
-    local controller_api_code
+    local controller_api_output
+    local controller_api_status
     local controller_role
 
     for controller_ip in "${configured_controllers[@]}"; do
@@ -2276,25 +2277,16 @@ check_cluster_status() {
             controller_role="additional"
         fi
 
-        if command -v curl &>/dev/null; then
-            controller_api_code=$(curl -ksS --connect-timeout 2 --max-time 5 \
-                -o /dev/null -w '%{http_code}' "https://${controller_ip}:6443/readyz" 2>/dev/null)
-            case "$controller_api_code" in
-                200)
-                    print_successful "${CLUSTER_NAME}-ctrl-${controller_index} (${controller_ip}, ${controller_role}): API reachable (HTTP 200)"
-                    ;;
-                401|403)
-                    print_info "${CLUSTER_NAME}-ctrl-${controller_index} (${controller_ip}, ${controller_role}): API reachable (HTTP ${controller_api_code}; authentication required)"
-                    ;;
-                000|"")
-                    print_warning "${CLUSTER_NAME}-ctrl-${controller_index} (${controller_ip}, ${controller_role}): API unreachable"
-                    ;;
-                *)
-                    print_warning "${CLUSTER_NAME}-ctrl-${controller_index} (${controller_ip}, ${controller_role}): API responded HTTP ${controller_api_code}"
-                    ;;
-            esac
+        controller_api_output=$(k0s kubectl \
+            --server="https://${controller_ip}:6443" \
+            --request-timeout=5s get --raw=/readyz 2>&1)
+        controller_api_status=$?
+        if [ "$controller_api_status" -eq 0 ]; then
+            controller_api_output=$(printf '%s' "$controller_api_output" | tr '\n' ' ')
+            print_successful "${CLUSTER_NAME}-ctrl-${controller_index} (${controller_ip}, ${controller_role}): API ready${controller_api_output:+ (${controller_api_output})}"
         else
-            print_warning "${CLUSTER_NAME}-ctrl-${controller_index} (${controller_ip}, ${controller_role}): curl is not installed; API check skipped"
+            print_warning "${CLUSTER_NAME}-ctrl-${controller_index} (${controller_ip}, ${controller_role}): API check failed"
+            echo "  $controller_api_output"
         fi
         controller_index=$((controller_index + 1))
     done
