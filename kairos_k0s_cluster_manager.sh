@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.61"
+SCRIPT_VERSION="1.0.62"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -2482,6 +2482,7 @@ check_control_plane_vip_status() {
     local identity_file=""
     local candidate_key
     local vip_api_output
+    local -a ssh_args
 
     print_info "Control-plane VIP / load balancing:"
     echo "Configured VIP: ${vip_cidr}"
@@ -2537,12 +2538,15 @@ check_control_plane_vip_status() {
                 owner_list+=("${CLUSTER_NAME}-ctrl-${controller_index} (${controller_ip})")
                 owner_count=$((owner_count + 1))
             fi
-        elif command -v ssh &>/dev/null && [ -n "$identity_file" ]; then
+        elif command -v ssh &>/dev/null; then
+            ssh_args=(
+                -o BatchMode=yes
+                -o ConnectTimeout=5
+                -o StrictHostKeyChecking=accept-new
+            )
+            [ -n "$identity_file" ] && ssh_args=(-i "$identity_file" "${ssh_args[@]}")
             remote_address_output=$(ssh \
-                -i "$identity_file" \
-                -o BatchMode=yes \
-                -o ConnectTimeout=5 \
-                -o StrictHostKeyChecking=accept-new \
+                "${ssh_args[@]}" \
                 "root@${controller_ip}" \
                 "ip -4 -o addr show 2>/dev/null" 2>/dev/null)
             remote_status=$?
