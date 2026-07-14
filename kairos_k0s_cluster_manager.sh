@@ -36,6 +36,7 @@ KAIROS_DOCKERFILE="Dockerfile.kairos"
 K0S_KUBECONFIG="/var/lib/k0s/pki/admin.conf"
 K0S_CONFIG_PATH="/etc/k0s/k0s.yaml"
 K0S_TOKEN_FILE="/etc/k0s/token"
+KUBELET_ROOT_DIR="/var/lib/kubelet"
 CONTROLLER_MANAGEMENT_KEY_PATH="${HOME}/.ssh/id_ed25519_k0s_controllers"
 
 # Kairos image defaults
@@ -46,7 +47,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.65"
+SCRIPT_VERSION="1.0.67"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -66,6 +67,7 @@ build_controller_k0s_args() {
 
     if [ "${CONTROLLER_WORKER:-n}" = "y" ]; then
         printf '    - --enable-worker\n'
+        printf '    - --kubelet-root-dir=/var/lib/kubelet\n'
         printf '    - --no-taints\n'
     fi
 }
@@ -870,7 +872,7 @@ ${CONTROLLER_MANAGEMENT_WRITE_FILES_BLOCK}
 # k0s state and kubelet must persist on an immutable OS
 bind_mounts:
   - /var/lib/k0s
-  - /var/lib/k0s/kubelet
+  - /var/lib/kubelet
 
 stages:
   boot:
@@ -883,10 +885,10 @@ stages:
       commands:
         - systemctl enable iscsid
         - systemctl start iscsid
-    - name: "Ensure k0s kubelet root dir exists"
-      if: "[ ! -d /var/lib/k0s/kubelet ]"
+    - name: "Ensure standard kubelet root dir exists"
+      if: "[ ! -d /var/lib/kubelet ]"
       commands:
-        - mkdir -p /var/lib/k0s/kubelet
+        - mkdir -p /var/lib/kubelet
     - name: "Configure controller shell defaults"
       commands:
         - mkdir -p /etc/profile.d /etc/bash_completion.d /usr/local/bin /usr/local/sbin
@@ -984,6 +986,7 @@ k0s-worker:
   enabled: true
   args:
     - --token-file ${K0S_TOKEN_FILE}
+    - --kubelet-root-dir=/var/lib/kubelet
 
 write_files:
   - path: ${K0S_TOKEN_FILE}
@@ -1015,7 +1018,7 @@ write_files:
 # Persistent paths — survive reboots and OS upgrades (read-write bind mounts)
 bind_mounts:
   - /var/lib/k0s
-  - /var/lib/k0s/kubelet
+  - /var/lib/kubelet
 
 stages:
   boot:
@@ -1027,10 +1030,10 @@ stages:
       commands:
         - systemctl enable iscsid
         - systemctl start iscsid
-    - name: "Ensure k0s kubelet root dir exists"
-      if: "[ ! -d /var/lib/k0s/kubelet ]"
+    - name: "Ensure standard kubelet root dir exists"
+      if: "[ ! -d /var/lib/kubelet ]"
       commands:
-        - mkdir -p /var/lib/k0s/kubelet
+        - mkdir -p /var/lib/kubelet
 
 # Reset behavior
 reset:
@@ -1434,7 +1437,7 @@ ${CONTROLLER_MANAGEMENT_WRITE_FILES_BLOCK}
 # Persistent paths
 bind_mounts:
   - /var/lib/k0s
-  - /var/lib/k0s/kubelet
+  - /var/lib/kubelet
 
 stages:
   boot:
@@ -1446,10 +1449,10 @@ stages:
       commands:
         - systemctl enable iscsid
         - systemctl start iscsid
-    - name: "Ensure k0s kubelet root dir exists"
-      if: "[ ! -d /var/lib/k0s/kubelet ]"
+    - name: "Ensure standard kubelet root dir exists"
+      if: "[ ! -d /var/lib/kubelet ]"
       commands:
-        - mkdir -p /var/lib/k0s/kubelet
+        - mkdir -p /var/lib/kubelet
     - name: "Configure controller shell defaults"
       commands:
         - mkdir -p /etc/profile.d /etc/bash_completion.d /usr/local/bin /usr/local/sbin
@@ -2800,6 +2803,108 @@ check_cilium_connection_point() {
     echo ""
 }
 
+ssh_read_kubelet_root_dir() {
+    local node_ip="$1"
+    local root_dir_command
+    local remote_root_dir
+    local candidate_key
+    local -a ssh_args
+
+    root_dir_command="ps -eo args 2>/dev/null | grep '[k]ubelet' | grep -o -- '--root-dir=[^ ]*' | head -n 1 | cut -d= -f2"
+
+    for candidate_key in "$HOME/.ssh/id_ed25519_kairos" "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_rsa" "$CONTROLLER_MANAGEMENT_KEY_PATH"; do
+        [ -r "$candidate_key" ] || continue
+        ssh_args=(
+            -i "$candidate_key"
+            -o BatchMode=yes
+            -o ConnectTimeout=5
+            -o StrictHostKeyChecking=accept-new
+        )
+        remote_root_dir=$(ssh "${ssh_args[@]}" "root@${node_ip}" "$root_dir_command" 2>/dev/null)
+        if [ $? -eq 0 ]; then
+            printf '%s\n' "$remote_root_dir"
+            return 0
+        fi
+    done
+
+    if command -v ssh &>/dev/null; then
+        ssh_args=(
+            -o BatchMode=yes
+            -o ConnectTimeout=5
+            -o StrictHostKeyChecking=accept-new
+        )
+        remote_root_dir=$(ssh "${ssh_args[@]}" "root@${node_ip}" "$root_dir_command" 2>/dev/null)
+        if [ $? -eq 0 ]; then
+            printf '%s\n' "$remote_root_dir"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+check_kubelet_root_dir_status() {
+    local node_names
+    local node_name
+    local node_ip
+    local root_dir
+    local local_addresses=""
+    local local_root_dir
+    local nodes_output
+
+    print_info "Kubelet root directory (expected: ${KUBELET_ROOT_DIR}):"
+    if ! command -v k0s &>/dev/null; then
+        print_error "k0s not found on this node."
+        return 1
+    fi
+
+    if command -v ip &>/dev/null; then
+        local_addresses=$(ip -4 -o addr show 2>/dev/null)
+    fi
+
+    nodes_output=$(k0s kubectl get nodes -o wide 2>&1)
+    if [ $? -ne 0 ]; then
+        print_warning "Could not list nodes:"
+        echo "$nodes_output"
+        echo ""
+        return 1
+    fi
+
+    node_names=$(k0s kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)
+    if [ -z "$node_names" ]; then
+        print_info "No nodes are registered yet."
+        echo ""
+        return 0
+    fi
+
+    while IFS= read -r node_name; do
+        [ -n "$node_name" ] || continue
+        node_ip=$(k0s kubectl get node "$node_name" \
+            -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null)
+        root_dir=""
+
+        if [ -n "$node_ip" ] && ip_output_contains_address "$local_addresses" "$node_ip"; then
+            local_root_dir=$(ps -eo args 2>/dev/null \
+                | grep '[k]ubelet' \
+                | grep -o -- '--root-dir=[^ ]*' \
+                | head -n 1 \
+                | cut -d= -f2)
+            root_dir="$local_root_dir"
+        elif [ -n "$node_ip" ]; then
+            root_dir=$(ssh_read_kubelet_root_dir "$node_ip")
+        fi
+
+        if [ -z "$root_dir" ]; then
+            print_warning "${node_name} (${node_ip:-IP unknown}): kubelet root directory could not be read"
+        elif [ "$root_dir" = "$KUBELET_ROOT_DIR" ]; then
+            print_successful "${node_name} (${node_ip}): ${root_dir}"
+        else
+            print_warning "${node_name} (${node_ip}): ${root_dir} (expected ${KUBELET_ROOT_DIR})"
+        fi
+    done <<< "$node_names"
+    echo ""
+}
+
 check_cluster_status() {
     print_info "Checking cluster status (local)..."
 
@@ -2932,6 +3037,33 @@ check_cluster_status() {
             print_info "Cilium not detected yet. Run 'Manage Cilium' after the control plane is ready."
         fi
     fi
+}
+
+manage_cluster_status() {
+    while true; do
+        echo -e "${YELLOW}======== Cluster Status / Diagnostics ========${NC}"
+        echo "1. Full Cluster Status"
+        echo "2. Check Kubelet Root Directory"
+        echo "3. Check Cilium API Connection Point"
+        echo "4. Check NLLB / Worker Proxy Status"
+        echo "5. Back to Main Menu"
+        echo -e "${YELLOW}==============================================${NC}"
+        if ! read -p "Enter your choice: " status_choice; then
+            echo ""
+            print_info "Input closed. Returning to main menu."
+            return 0
+        fi
+
+        case "$status_choice" in
+            1) check_cluster_status ;;
+            2) check_kubelet_root_dir_status ;;
+            3) check_cilium_connection_point ;;
+            4) check_nllb_status ;;
+            5) return 0 ;;
+            "") continue ;;
+            *) print_error "Invalid option." ;;
+        esac
+    done
 }
 
 github_release_tags() {
@@ -4350,7 +4482,7 @@ while true; do
     echo "9.  Manage Longhorn Backups / Restore"
     echo "10. Manage BGP Configuration"
     echo "11. Check Versions"
-    echo "12. Check Cluster Status"
+    echo "12. Cluster Status / Diagnostics"
     echo "13. Reset Node"
     echo "14. Rolling OS Upgrade (A/B)"
     echo "15. Update Script Now (no reboot)"
@@ -4375,7 +4507,7 @@ while true; do
         9) manage_longhorn ;;
         10) manage_bgp ;;
         11) check_versions ;;
-        12) ensure_config && check_cluster_status ;;
+        12) ensure_config && manage_cluster_status ;;
         13) reset_node ;;
         14) kairos_rolling_upgrade ;;
         15) update_script_now ;;
