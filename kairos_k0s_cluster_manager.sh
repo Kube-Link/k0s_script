@@ -46,7 +46,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.64"
+SCRIPT_VERSION="1.0.65"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -3285,7 +3285,7 @@ generate_bgp_config() {
     fi
 
     cat > ./bgp_config/CiliumBGPClusterConfig.yaml << EOF
-apiVersion: cilium.io/v2alpha1
+apiVersion: cilium.io/v2
 kind: CiliumBGPClusterConfig
 metadata:
   name: cilium-bgp
@@ -3308,7 +3308,7 @@ $NODE_SELECTOR_VALUES
 EOF
 
     cat > ./bgp_config/CiliumBGPPeerConfig.yaml << EOF
-apiVersion: cilium.io/v2alpha1
+apiVersion: cilium.io/v2
 kind: CiliumBGPPeerConfig
 metadata:
   name: cilium-peer
@@ -3326,7 +3326,7 @@ spec:
 EOF
 
     cat > ./bgp_config/CiliumBGPAdvertisement.yaml << EOF
-apiVersion: cilium.io/v2alpha1
+apiVersion: cilium.io/v2
 kind: CiliumBGPAdvertisement
 metadata:
   name: bgp-advertisements
@@ -3344,7 +3344,7 @@ spec:
 EOF
 
     cat > ./bgp_config/CiliumLoadBalancerIPPool.yaml << EOF
-apiVersion: "cilium.io/v2alpha1"
+apiVersion: "cilium.io/v2"
 kind: CiliumLoadBalancerIPPool
 metadata:
   name: "first-pool"
