@@ -47,7 +47,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.68"
+SCRIPT_VERSION="1.0.70"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -2819,7 +2819,7 @@ ssh_read_kubelet_root_dir() {
     local -a ssh_args
 
     SSH_READ_KUBELET_ROOT_ERROR=""
-    root_dir_command="ps -eo args 2>/dev/null | sed -n -e 's/.*--root-dir=\([^ ]*\).*/\1/p' -e 's/.*--kubelet-root-dir=\([^ ]*\).*/\1/p' | head -n 1"
+    root_dir_command="(ps -eo args 2>/dev/null; systemctl show k0sworker -p ExecStart --value 2>/dev/null; systemctl show k0scontroller -p ExecStart --value 2>/dev/null) | sed -n -e 's/.*--root-dir=\([^ ]*\).*/\1/p' -e 's/.*--kubelet-root-dir=\([^ ]*\).*/\1/p' | head -n 1"
 
     if ! command -v ssh &>/dev/null; then
         SSH_READ_KUBELET_ROOT_ERROR="ssh is not installed on the controller"
@@ -2829,6 +2829,7 @@ ssh_read_kubelet_root_dir() {
     for candidate_key in "$CONTROLLER_MANAGEMENT_KEY_PATH" "$HOME/.ssh/id_ed25519_kairos" "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_rsa"; do
         [ -r "$candidate_key" ] || continue
         ssh_args=(
+            -n
             -i "$candidate_key"
             -o BatchMode=yes
             -o ConnectTimeout=5
@@ -2843,6 +2844,7 @@ ssh_read_kubelet_root_dir() {
     done
 
     ssh_args=(
+        -n
         -o BatchMode=yes
         -o ConnectTimeout=5
         -o StrictHostKeyChecking=accept-new
@@ -2904,11 +2906,16 @@ check_kubelet_root_dir_status() {
         SSH_READ_KUBELET_ROOT_ERROR=""
 
         if [ -n "$node_ip" ] && ip_output_contains_address "$local_addresses" "$node_ip"; then
-            local_root_dir=$(ps -eo args 2>/dev/null \
-                | sed -n \
+            local_root_dir=$(
+                (
+                    ps -eo args 2>/dev/null
+                    systemctl show k0sworker -p ExecStart --value 2>/dev/null
+                    systemctl show k0scontroller -p ExecStart --value 2>/dev/null
+                ) | sed -n \
                     -e 's/.*--root-dir=\([^ ]*\).*/\1/p' \
                     -e 's/.*--kubelet-root-dir=\([^ ]*\).*/\1/p' \
-                | head -n 1)
+                | head -n 1
+            )
             root_dir="$local_root_dir"
         elif [ -n "$node_ip" ]; then
             root_dir=$(ssh_read_kubelet_root_dir "$node_ip")
