@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.56"
+SCRIPT_VERSION="1.0.57"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -2641,10 +2641,9 @@ check_versions() {
         echo "3. Check Cilium Version"
         echo "4. Check FluxCD Version"
         echo "5. Check Script Version"
-        echo "6. Update Script Now"
-        echo "7. List Available Versions"
-        echo "8. Check All Versions"
-        echo "9. Back to Main Menu"
+        echo "6. List Available Versions"
+        echo "7. Check All Versions"
+        echo "8. Back to Main Menu"
         if ! read -p "Enter your choice: " check_choice; then
             echo ""
             print_info "Input closed. Returning to main menu."
@@ -2657,9 +2656,8 @@ check_versions() {
             3) check_cilium_version ;;
             4) check_fluxcd_version ;;
             5) check_script_version ;;
-            6) update_script_now ;;
-            7) list_available_versions ;;
-            8)
+            6) list_available_versions ;;
+            7)
                 check_k0s_version; echo ""
                 check_kairos_version; echo ""
                 check_cilium_version; echo ""
@@ -2668,7 +2666,7 @@ check_versions() {
                 read -p "Would you like to see all available versions? (y/n): " list_choice
                 [ "$list_choice" = "y" ] && list_available_versions
                 ;;
-            9) return 0 ;;
+            8) return 0 ;;
             "") continue ;;
             *) print_error "Invalid option." ;;
         esac
@@ -3834,8 +3832,9 @@ while true; do
     echo "12. Check Cluster Status"
     echo "13. Reset Node"
     echo "14. Rolling OS Upgrade (A/B)"
-    echo "15. Show Config File"
-    echo "16. Exit"
+    echo "15. Update Script Now (no reboot)"
+    echo "16. Show Config File"
+    echo "17. Exit"
     echo -e "${YELLOW}=================================================${NC}"
     if ! read -p "Enter your choice: " choice; then
         echo ""
@@ -3858,8 +3857,9 @@ while true; do
         12) ensure_config && check_cluster_status ;;
         13) reset_node ;;
         14) kairos_rolling_upgrade ;;
-        15) show_config_file ;;
-        16) echo "Exiting..."; exit 0 ;;
+        15) update_script_now ;;
+        16) show_config_file ;;
+        17) echo "Exiting..."; exit 0 ;;
         "") continue ;;
         *) print_error "Invalid option." ;;
     esac
