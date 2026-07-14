@@ -45,7 +45,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.49"
+SCRIPT_VERSION="1.0.50"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -2261,6 +2261,68 @@ check_cluster_status() {
     k0s status 2>/dev/null || print_warning "Unable to read k0s status."
     echo ""
 
+    print_info "Configured controllers:"
+    local configured_controllers=("$CONTROLLER_IP" "${ADDITIONAL_CONTROLLERS[@]}")
+    local controller_index=1
+    local controller_ip
+    local controller_api_code
+    local controller_role
+
+    for controller_ip in "${configured_controllers[@]}"; do
+        [ -n "$controller_ip" ] || continue
+        if [ "$controller_index" -eq 1 ]; then
+            controller_role="primary"
+        else
+            controller_role="additional"
+        fi
+
+        if command -v curl &>/dev/null; then
+            controller_api_code=$(curl -ksS --connect-timeout 2 --max-time 5 \
+                -o /dev/null -w '%{http_code}' "https://${controller_ip}:6443/readyz" 2>/dev/null)
+            case "$controller_api_code" in
+                200)
+                    print_successful "${CLUSTER_NAME}-ctrl-${controller_index} (${controller_ip}, ${controller_role}): API reachable (HTTP 200)"
+                    ;;
+                401|403)
+                    print_info "${CLUSTER_NAME}-ctrl-${controller_index} (${controller_ip}, ${controller_role}): API reachable (HTTP ${controller_api_code}; authentication required)"
+                    ;;
+                000|"")
+                    print_warning "${CLUSTER_NAME}-ctrl-${controller_index} (${controller_ip}, ${controller_role}): API unreachable"
+                    ;;
+                *)
+                    print_warning "${CLUSTER_NAME}-ctrl-${controller_index} (${controller_ip}, ${controller_role}): API responded HTTP ${controller_api_code}"
+                    ;;
+            esac
+        else
+            print_warning "${CLUSTER_NAME}-ctrl-${controller_index} (${controller_ip}, ${controller_role}): curl is not installed; API check skipped"
+        fi
+        controller_index=$((controller_index + 1))
+    done
+    echo ""
+
+    print_info "etcd controller membership:"
+    local etcd_members_output
+    local etcd_member_list_status
+    etcd_members_output=$(k0s etcd member-list 2>&1)
+    etcd_member_list_status=$?
+    if [ "$etcd_member_list_status" -eq 0 ]; then
+        echo "$etcd_members_output"
+        controller_index=1
+        for controller_ip in "${configured_controllers[@]}"; do
+            [ -n "$controller_ip" ] || continue
+            if printf '%s\n' "$etcd_members_output" | grep -Fq "https://${controller_ip}:2380"; then
+                print_successful "${CLUSTER_NAME}-ctrl-${controller_index} (${controller_ip}): etcd member present"
+            else
+                print_warning "${CLUSTER_NAME}-ctrl-${controller_index} (${controller_ip}): not found in etcd member list"
+            fi
+            controller_index=$((controller_index + 1))
+        done
+    else
+        print_warning "Could not read etcd member list:"
+        echo "$etcd_members_output"
+    fi
+    echo ""
+
     print_info "Kubernetes API readiness:"
     local api_ready
     api_ready=$(k0s kubectl get --raw=/readyz 2>&1)
@@ -3761,7 +3823,7 @@ while true; do
         9) manage_longhorn ;;
         10) manage_bgp ;;
         11) check_versions ;;
-        12) check_cluster_status ;;
+        12) ensure_config && check_cluster_status ;;
         13) reset_node ;;
         14) kairos_rolling_upgrade ;;
         15) show_config_file ;;
