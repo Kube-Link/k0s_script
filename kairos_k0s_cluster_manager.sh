@@ -47,7 +47,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.70"
+SCRIPT_VERSION="1.0.71"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -4103,6 +4103,35 @@ longhorn_list_backup_inventory() {
     done
 }
 
+longhorn_check_old_backup_target() {
+    longhorn_require_cluster || return 1
+
+    if ! longhorn_kubectl get backuptargets.longhorn.io -n longhorn-system &>/dev/null; then
+        print_error "No Longhorn backup target is configured."
+        print_info "Configure the old cluster's backup target first, then run the inventory sync."
+        return 1
+    fi
+
+    print_info "Old backup target status:"
+    longhorn_kubectl get backuptargets.longhorn.io -n longhorn-system \
+        -o custom-columns=NAME:.metadata.name,URL:.spec.backupTarget,AVAILABLE:.status.available,STATE:.status.state
+    echo ""
+
+    local backup_volume_count backup_count
+    backup_volume_count=$(longhorn_kubectl get backupvolumes.longhorn.io -n longhorn-system --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    backup_count=$(longhorn_kubectl get backups.longhorn.io -n longhorn-system --no-headers 2>/dev/null | wc -l | tr -d ' ')
+
+    echo "Imported old backup volumes: ${backup_volume_count:-0}"
+    echo "Imported old backups:        ${backup_count:-0}"
+    if [ "${backup_volume_count:-0}" -gt 0 ] && [ "${backup_count:-0}" -gt 0 ]; then
+        print_successful "Old backup inventory is available for restore."
+    else
+        print_warning "The target is configured, but the old backup inventory is not available yet."
+        print_info "Use the Longhorn UI's sync action or wait for Longhorn to scan the backup target."
+        return 1
+    fi
+}
+
 longhorn_restore_status() {
     longhorn_require_cluster || return 1
 
@@ -4139,6 +4168,633 @@ longhorn_wait_for_restore() {
 
     print_warning "Timed out waiting for restore. You can check again from the Longhorn menu."
     return 1
+}
+
+longhorn_pvc_workloads() {
+    local namespace="$1"
+    local pvc_name="$2"
+    local kind resource resource_name claims template_claim
+
+    for kind in deployment statefulset daemonset; do
+        while IFS= read -r resource; do
+            [ -z "$resource" ] && continue
+            resource_name="${resource#*/}"
+            claims=$(longhorn_kubectl get "$resource" -n "$namespace" \
+                -o jsonpath='{range .spec.template.spec.volumes[*]}{.persistentVolumeClaim.claimName}{"\n"}{end}' \
+                2>/dev/null)
+            if printf '%s\n' "$claims" | grep -Fxq -- "$pvc_name"; then
+                printf '%s/%s\n' "$kind" "$resource_name"
+                continue
+            fi
+            if [ "$kind" = "statefulset" ]; then
+                while IFS= read -r template_claim; do
+                    [ -z "$template_claim" ] && continue
+                    case "$pvc_name" in
+                        "${template_claim}-${resource_name}-"*)
+                            printf '%s/%s\n' "$kind" "$resource_name"
+                            break
+                            ;;
+                    esac
+                done < <(longhorn_kubectl get "$resource" -n "$namespace" \
+                    -o jsonpath='{range .spec.volumeClaimTemplates[*]}{.metadata.name}{"\n"}{end}' \
+                    2>/dev/null)
+            fi
+        done < <(longhorn_kubectl get "$kind" -n "$namespace" -o name 2>/dev/null)
+    done
+}
+
+longhorn_pvc_pods() {
+    local namespace="$1"
+    local pvc_name="$2"
+    local pod claims
+
+    while IFS= read -r pod; do
+        [ -z "$pod" ] && continue
+        claims=$(longhorn_kubectl get "$pod" -n "$namespace" \
+            -o jsonpath='{range .spec.volumes[*]}{.persistentVolumeClaim.claimName}{"\n"}{end}' \
+            2>/dev/null)
+        if printf '%s\n' "$claims" | grep -Fxq -- "$pvc_name"; then
+            printf '%s\n' "${pod#*/}"
+        fi
+    done < <(longhorn_kubectl get pods -n "$namespace" -o name 2>/dev/null)
+}
+
+longhorn_wait_for_pvc_pods_gone() {
+    local namespace="$1"
+    local pvc_name="$2"
+    local timeout_seconds="${3:-180}"
+    local deadline=$((SECONDS + timeout_seconds))
+
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        local pods=()
+        mapfile -t pods < <(longhorn_pvc_pods "$namespace" "$pvc_name")
+        if [ "${#pods[@]}" -eq 0 ]; then
+            print_successful "No pods are using PVC ${namespace}/${pvc_name}."
+            return 0
+        fi
+        print_info "Waiting for PVC users to stop: ${pods[*]}"
+        sleep 5
+    done
+
+    print_error "Pods are still using PVC ${namespace}/${pvc_name}."
+    return 1
+}
+
+longhorn_wait_for_volume_detached() {
+    local volume_name="$1"
+    local timeout_seconds="${2:-180}"
+    local deadline=$((SECONDS + timeout_seconds))
+
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        local state
+        state=$(longhorn_kubectl get volumes.longhorn.io "$volume_name" -n longhorn-system \
+            -o jsonpath='{.status.state}' 2>/dev/null)
+        if [ "$state" = "detached" ]; then
+            print_successful "Longhorn volume ${volume_name} is detached."
+            return 0
+        fi
+        if [ -z "$state" ]; then
+            print_error "Longhorn volume ${volume_name} disappeared while waiting for detach."
+            return 1
+        fi
+        print_info "Waiting for Longhorn volume ${volume_name} to detach (state: ${state})..."
+        sleep 5
+    done
+
+    print_error "Timed out waiting for Longhorn volume ${volume_name} to detach."
+    return 1
+}
+
+longhorn_wait_for_restore_detached() {
+    local volume_name="$1"
+    local timeout_seconds="${2:-1800}"
+    local deadline=$((SECONDS + timeout_seconds))
+
+    print_info "Waiting for restored volume ${volume_name} to finish..."
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        local restore_required state robustness
+        restore_required=$(longhorn_kubectl get volumes.longhorn.io "$volume_name" -n longhorn-system \
+            -o jsonpath='{.status.restoreRequired}' 2>/dev/null)
+        state=$(longhorn_kubectl get volumes.longhorn.io "$volume_name" -n longhorn-system \
+            -o jsonpath='{.status.state}' 2>/dev/null)
+        robustness=$(longhorn_kubectl get volumes.longhorn.io "$volume_name" -n longhorn-system \
+            -o jsonpath='{.status.robustness}' 2>/dev/null)
+
+        printf '  volume=%s state=%s robustness=%s restoreRequired=%s\n' \
+            "$volume_name" \
+            "$(longhorn_display_value "$state")" \
+            "$(longhorn_display_value "$robustness")" \
+            "$(longhorn_display_value "$restore_required")"
+
+        if [ "$restore_required" = "false" ] && [ "$state" = "detached" ]; then
+            print_successful "Restore completed and volume is detached."
+            return 0
+        fi
+
+        if [ -z "$restore_required" ] && [ -z "$state" ]; then
+            print_error "Restored Longhorn volume ${volume_name} could not be read."
+            return 1
+        fi
+        sleep 10
+    done
+
+    print_error "Timed out waiting for restored volume ${volume_name}."
+    return 1
+}
+
+longhorn_suspend_flux_resource() {
+    local kind="$1"
+    local name="$2"
+    local namespace="$3"
+    local suspended
+
+    LONGHORN_FLUX_GUARDED_KINDS+=("$kind")
+    LONGHORN_FLUX_GUARDED_NAMES+=("$name")
+    LONGHORN_FLUX_GUARDED_NAMESPACES+=("$namespace")
+
+    suspended=$(longhorn_kubectl get "$kind" "$name" -n "$namespace" -o jsonpath='{.spec.suspend}' 2>/dev/null)
+    if [ "$suspended" = "true" ]; then
+        print_successful "Flux ${kind} ${namespace}/${name} is already suspended."
+        return 0
+    fi
+
+    print_info "Suspending Flux ${kind} ${namespace}/${name}..."
+    if ! longhorn_kubectl patch "$kind" "$name" -n "$namespace" \
+        --type merge -p '{"spec":{"suspend":true}}'; then
+        print_error "Could not suspend Flux ${kind} ${namespace}/${name}."
+        return 1
+    fi
+    suspended=$(longhorn_kubectl get "$kind" "$name" -n "$namespace" -o jsonpath='{.spec.suspend}' 2>/dev/null)
+    if [ "$suspended" != "true" ]; then
+        print_error "Flux ${kind} ${namespace}/${name} did not remain suspended."
+        return 1
+    fi
+
+    LONGHORN_FLUX_CHANGED_KINDS+=("$kind")
+    LONGHORN_FLUX_CHANGED_NAMES+=("$name")
+    LONGHORN_FLUX_CHANGED_NAMESPACES+=("$namespace")
+    print_successful "Flux ${kind} ${namespace}/${name} suspended."
+}
+
+longhorn_validate_flux_suspended() {
+    local index suspended
+    for ((index = 0; index < ${#LONGHORN_FLUX_GUARDED_NAMES[@]}; index++)); do
+        suspended=$(longhorn_kubectl get "${LONGHORN_FLUX_GUARDED_KINDS[$index]}" \
+            "${LONGHORN_FLUX_GUARDED_NAMES[$index]}" \
+            -n "${LONGHORN_FLUX_GUARDED_NAMESPACES[$index]}" \
+            -o jsonpath='{.spec.suspend}' 2>/dev/null)
+        if [ "$suspended" != "true" ]; then
+            print_error "Flux ${LONGHORN_FLUX_GUARDED_KINDS[$index]} ${LONGHORN_FLUX_GUARDED_NAMESPACES[$index]}/${LONGHORN_FLUX_GUARDED_NAMES[$index]} is no longer suspended."
+            return 1
+        fi
+    done
+    return 0
+}
+
+longhorn_resume_flux_resources() {
+    local index suspended result=0
+    for ((index = ${#LONGHORN_FLUX_CHANGED_NAMES[@]} - 1; index >= 0; index--)); do
+        print_info "Resuming Flux ${LONGHORN_FLUX_CHANGED_KINDS[$index]} ${LONGHORN_FLUX_CHANGED_NAMESPACES[$index]}/${LONGHORN_FLUX_CHANGED_NAMES[$index]}..."
+        if ! longhorn_kubectl patch "${LONGHORN_FLUX_CHANGED_KINDS[$index]}" \
+            "${LONGHORN_FLUX_CHANGED_NAMES[$index]}" \
+            -n "${LONGHORN_FLUX_CHANGED_NAMESPACES[$index]}" \
+            --type merge -p '{"spec":{"suspend":false}}'; then
+            print_error "Could not resume Flux resource."
+            result=1
+            continue
+        fi
+        suspended=$(longhorn_kubectl get "${LONGHORN_FLUX_CHANGED_KINDS[$index]}" \
+            "${LONGHORN_FLUX_CHANGED_NAMES[$index]}" \
+            -n "${LONGHORN_FLUX_CHANGED_NAMESPACES[$index]}" \
+            -o jsonpath='{.spec.suspend}' 2>/dev/null)
+        if [ "$suspended" = "true" ]; then
+            print_error "Flux resource is still suspended."
+            result=1
+        else
+            print_successful "Flux resource resumed."
+        fi
+    done
+    return "$result"
+}
+
+longhorn_wait_for_flux_ready() {
+    local index result=0
+    for ((index = 0; index < ${#LONGHORN_FLUX_CHANGED_NAMES[@]}; index++)); do
+        print_info "Waiting for Flux ${LONGHORN_FLUX_CHANGED_KINDS[$index]} ${LONGHORN_FLUX_CHANGED_NAMESPACES[$index]}/${LONGHORN_FLUX_CHANGED_NAMES[$index]} to become Ready..."
+        if longhorn_kubectl wait "${LONGHORN_FLUX_CHANGED_KINDS[$index]}" \
+            "${LONGHORN_FLUX_CHANGED_NAMES[$index]}" \
+            -n "${LONGHORN_FLUX_CHANGED_NAMESPACES[$index]}" \
+            --for=condition=Ready --timeout=180s; then
+            print_successful "Flux resource is Ready."
+        else
+            print_error "Flux resource did not become Ready within 180 seconds."
+            result=1
+        fi
+    done
+    return "$result"
+}
+
+longhorn_restore_workloads() {
+    local index workload kind replicas result=0
+    if [ "${LONGHORN_RESTORE_WORKLOADS_SCALED:-n}" != "y" ]; then
+        return 0
+    fi
+
+    for ((index = 0; index < ${#LONGHORN_RESTORE_WORKLOADS[@]}; index++)); do
+        workload="${LONGHORN_RESTORE_WORKLOADS[$index]}"
+        kind="${workload%%/*}"
+        replicas="${LONGHORN_RESTORE_WORKLOAD_REPLICAS[$index]}"
+        if [ "$kind" = "deployment" ] || [ "$kind" = "statefulset" ]; then
+            if [ "$replicas" != "-" ] && [ "$replicas" -gt 0 ]; then
+                if longhorn_kubectl scale "$workload" -n "$LONGHORN_RESTORE_WORKLOAD_NAMESPACE" --replicas="$replicas"; then
+                    print_successful "Restored ${workload} replica count to ${replicas}."
+                else
+                    print_error "Could not restore replica count for ${workload}."
+                    result=1
+                fi
+            fi
+        fi
+    done
+    return "$result"
+}
+
+longhorn_validate_flux_pause() {
+    local namespace="$1"
+    local pvc_name="$2"
+    local kustomization_name kustomization_namespace helmrelease_name helmrelease_namespace
+    local selected_flux_resource=n
+    LONGHORN_FLUX_GUARDED_KINDS=()
+    LONGHORN_FLUX_GUARDED_NAMES=()
+    LONGHORN_FLUX_GUARDED_NAMESPACES=()
+    LONGHORN_FLUX_CHANGED_KINDS=()
+    LONGHORN_FLUX_CHANGED_NAMES=()
+    LONGHORN_FLUX_CHANGED_NAMESPACES=()
+
+    local has_kustomizations=n has_helmreleases=n
+    longhorn_kubectl get crd kustomizations.kustomize.toolkit.fluxcd.io &>/dev/null && has_kustomizations=y
+    longhorn_kubectl get crd helmreleases.helm.toolkit.fluxcd.io &>/dev/null && has_helmreleases=y
+    if [ "$has_kustomizations" = "n" ] && [ "$has_helmreleases" = "n" ]; then
+        print_info "Flux Kustomization and HelmRelease CRDs not detected."
+        return 0
+    fi
+
+    print_info "Flux resources currently installed:"
+    if [ "$has_kustomizations" = "y" ]; then
+        longhorn_kubectl get kustomizations.kustomize.toolkit.fluxcd.io -A \
+            -o 'custom-columns=KIND:.kind,NAMESPACE:.metadata.namespace,NAME:.metadata.name,SUSPENDED:.spec.suspend' \
+            2>/dev/null || true
+    fi
+    if [ "$has_helmreleases" = "y" ]; then
+        longhorn_kubectl get helmreleases.helm.toolkit.fluxcd.io -A \
+            -o 'custom-columns=KIND:.kind,NAMESPACE:.metadata.namespace,NAME:.metadata.name,SUSPENDED:.spec.suspend' \
+            2>/dev/null || true
+    fi
+
+    read -p "Flux Kustomization managing ${namespace}/${pvc_name} (blank if none): " kustomization_name
+    if [ -n "$kustomization_name" ]; then
+        read -p "Flux Kustomization namespace (default: flux-system): " kustomization_namespace
+        kustomization_namespace=${kustomization_namespace:-flux-system}
+        if ! longhorn_kubectl get kustomization "$kustomization_name" -n "$kustomization_namespace" &>/dev/null; then
+            print_error "Flux Kustomization ${kustomization_namespace}/${kustomization_name} was not found."
+            return 1
+        fi
+        longhorn_suspend_flux_resource kustomization "$kustomization_name" "$kustomization_namespace" || return 1
+        selected_flux_resource=y
+    fi
+
+    read -p "Flux HelmRelease managing ${namespace}/${pvc_name} (blank if none): " helmrelease_name
+    if [ -n "$helmrelease_name" ]; then
+        read -p "Flux HelmRelease namespace (default: ${namespace}): " helmrelease_namespace
+        helmrelease_namespace=${helmrelease_namespace:-$namespace}
+        if ! longhorn_kubectl get helmrelease "$helmrelease_name" -n "$helmrelease_namespace" &>/dev/null; then
+            print_error "Flux HelmRelease ${helmrelease_namespace}/${helmrelease_name} was not found."
+            return 1
+        fi
+        longhorn_suspend_flux_resource helmrelease "$helmrelease_name" "$helmrelease_namespace" || return 1
+        selected_flux_resource=y
+    fi
+
+    if [ "$selected_flux_resource" = "n" ]; then
+        print_warning "No Flux resource was selected for ${namespace}/${pvc_name}."
+        prompt_yn flux_confirm "Confirm Flux does not manage this app/PVC? (y/n): " "n" || return 1
+        [ "$flux_confirm" = "y" ] || { print_error "Restore cancelled because Flux was not suspended."; return 1; }
+    fi
+
+    longhorn_validate_flux_suspended
+}
+
+longhorn_restore_into_existing_pvc_impl() {
+    longhorn_check_old_backup_target || return 1
+
+    print_info "Select the source application/volume to restore (latest backup):"
+    local lines=()
+    mapfile -t lines < <(longhorn_backup_volume_lines 2>/dev/null)
+    local backup_volumes=() source_volumes=() last_backups=() last_backup_ats=()
+    local size_bytes_values=() namespaces=() pvcs=() access_modes=()
+    local index=1 line backup_volume source_volume last_backup last_backup_at size_bytes storage_class kstatus access_mode
+    local source_namespace source_pvc
+
+    printf '%-4s %-20s %-30s %-22s %-20s %-8s %s\n' "NO" "SOURCE NS" "SOURCE PVC" "LAST_BACKUP" "LAST_BACKUP_AT" "ACCESS" "SOURCE_VOLUME"
+    for line in "${lines[@]}"; do
+        IFS=$'\t' read -r backup_volume source_volume last_backup last_backup_at size_bytes storage_class kstatus access_mode <<< "$line"
+        [ -z "$last_backup" ] && continue
+        source_namespace=$(longhorn_json_field "$kstatus" "namespace")
+        source_pvc=$(longhorn_json_field "$kstatus" "pvcName")
+        backup_volumes+=("$backup_volume")
+        source_volumes+=("$source_volume")
+        last_backups+=("$last_backup")
+        last_backup_ats+=("$last_backup_at")
+        size_bytes_values+=("$size_bytes")
+        namespaces+=("$source_namespace")
+        pvcs+=("$source_pvc")
+        access_modes+=("${access_mode:-rwo}")
+        printf '%-4s %-20s %-30s %-22s %-20s %-8s %s\n' \
+            "$index" \
+            "$(longhorn_display_value "$source_namespace")" \
+            "$(longhorn_display_value "$source_pvc")" \
+            "$last_backup" \
+            "$(longhorn_display_value "$last_backup_at")" \
+            "$(longhorn_display_value "${access_mode:-rwo}")" \
+            "$source_volume"
+        index=$((index + 1))
+    done
+
+    if [ "${#last_backups[@]}" -eq 0 ]; then
+        print_error "The old backup target is reachable, but no usable latest backups were imported."
+        return 1
+    fi
+
+    local selection selected selected_backup selected_source selected_backup_size selected_access_mode
+    read -p "Select backup number: " selection
+    if ! printf '%s' "$selection" | grep -Eq '^[0-9]+$' || [ "$selection" -lt 1 ] || [ "$selection" -gt "${#last_backups[@]}" ]; then
+        print_error "Invalid backup selection."
+        return 1
+    fi
+    selected=$((selection - 1))
+    selected_backup="${last_backups[$selected]}"
+    selected_source="${source_volumes[$selected]}"
+    selected_backup_size="${size_bytes_values[$selected]}"
+    selected_access_mode="${access_modes[$selected]}"
+    local backup_url volume_size
+    backup_url=$(longhorn_kubectl get backup.longhorn.io "${last_backups[$selected]}" -n longhorn-system -o jsonpath='{.status.url}' 2>/dev/null)
+    volume_size=$(longhorn_kubectl get backup.longhorn.io "${last_backups[$selected]}" -n longhorn-system -o jsonpath='{.status.volumeSize}' 2>/dev/null)
+    selected_backup_size=${volume_size:-$selected_backup_size}
+    if [ -z "$backup_url" ] || [ -z "$selected_backup_size" ]; then
+        print_error "Could not read the selected backup URL or exact byte size."
+        return 1
+    fi
+
+    local target_namespace target_pvc pvc_phase pv_name pv_handle pv_driver
+    local pvc_storage_class pvc_access_mode pv_capacity current_volume_size current_volume_state
+    read -p "Target PVC namespace (default: ${namespaces[$selected]:-default}): " target_namespace
+    target_namespace=${target_namespace:-${namespaces[$selected]:-default}}
+    read -p "Target PVC name (default: ${pvcs[$selected]}): " target_pvc
+    target_pvc=${target_pvc:-${pvcs[$selected]}}
+    LONGHORN_RESTORE_TARGET_NAMESPACE="$target_namespace"
+    LONGHORN_RESTORE_TARGET_PVC="$target_pvc"
+    if [ -z "$target_pvc" ]; then
+        print_error "A target PVC name is required."
+        return 1
+    fi
+
+    if ! longhorn_kubectl get namespace "$target_namespace" &>/dev/null; then
+        print_error "Target namespace does not exist: $target_namespace"
+        return 1
+    fi
+    if ! longhorn_kubectl get pvc "$target_pvc" -n "$target_namespace" &>/dev/null; then
+        print_error "Target PVC does not exist: ${target_namespace}/${target_pvc}"
+        print_info "Use 'Restore as a new PVC' for an application that is not deployed yet."
+        return 1
+    fi
+
+    pvc_phase=$(longhorn_kubectl get pvc "$target_pvc" -n "$target_namespace" -o jsonpath='{.status.phase}' 2>/dev/null)
+    pv_name=$(longhorn_kubectl get pvc "$target_pvc" -n "$target_namespace" -o jsonpath='{.spec.volumeName}' 2>/dev/null)
+    pvc_storage_class=$(longhorn_kubectl get pvc "$target_pvc" -n "$target_namespace" -o jsonpath='{.spec.storageClassName}' 2>/dev/null)
+    pvc_access_mode=$(longhorn_kubectl get pvc "$target_pvc" -n "$target_namespace" -o jsonpath='{.spec.accessModes[0]}' 2>/dev/null)
+    if [ "$pvc_phase" != "Bound" ] || [ -z "$pv_name" ]; then
+        print_error "Target PVC is not Bound: ${target_namespace}/${target_pvc} (phase: ${pvc_phase:-unknown})"
+        return 1
+    fi
+    if ! longhorn_kubectl get pv "$pv_name" &>/dev/null; then
+        print_error "The PVC references a missing PV: $pv_name"
+        return 1
+    fi
+
+    pv_handle=$(longhorn_kubectl get pv "$pv_name" -o jsonpath='{.spec.csi.volumeHandle}' 2>/dev/null)
+    pv_driver=$(longhorn_kubectl get pv "$pv_name" -o jsonpath='{.spec.csi.driver}' 2>/dev/null)
+    pv_capacity=$(longhorn_kubectl get pv "$pv_name" -o jsonpath='{.spec.capacity.storage}' 2>/dev/null)
+    if [ "$pv_driver" != "driver.longhorn.io" ] || [ -z "$pv_handle" ]; then
+        print_error "Target PV is not a Longhorn CSI PV: $pv_name"
+        return 1
+    fi
+    if ! longhorn_kubectl get volumes.longhorn.io "$pv_handle" -n longhorn-system &>/dev/null; then
+        print_error "The PV points to a missing Longhorn volume: $pv_handle"
+        return 1
+    fi
+
+    current_volume_size=$(longhorn_kubectl get volume "$pv_handle" -n longhorn-system -o jsonpath='{.spec.size}' 2>/dev/null)
+    current_volume_state=$(longhorn_kubectl get volume "$pv_handle" -n longhorn-system -o jsonpath='{.status.state}' 2>/dev/null)
+    local current_volume_access_mode current_volume_replicas current_volume_engine
+    current_volume_access_mode=$(longhorn_kubectl get volume "$pv_handle" -n longhorn-system -o jsonpath='{.spec.accessMode}' 2>/dev/null)
+    current_volume_replicas=$(longhorn_kubectl get volume "$pv_handle" -n longhorn-system -o jsonpath='{.spec.numberOfReplicas}' 2>/dev/null)
+    current_volume_engine=$(longhorn_kubectl get volume "$pv_handle" -n longhorn-system -o jsonpath='{.spec.dataEngine}' 2>/dev/null)
+    current_volume_access_mode=${current_volume_access_mode:-rwo}
+    current_volume_replicas=${current_volume_replicas:-3}
+    current_volume_engine=${current_volume_engine:-v1}
+
+    print_info "Existing application storage:"
+    echo "  Workload PVC:       ${target_namespace}/${target_pvc}"
+    echo "  PVC phase:          $pvc_phase"
+    echo "  PV:                 $pv_name"
+    echo "  Longhorn handle:    $pv_handle"
+    echo "  Longhorn state:     $current_volume_state"
+    echo "  StorageClass:       $(longhorn_display_value "$pvc_storage_class")"
+    echo "  Access mode:        $(longhorn_display_value "$pvc_access_mode")"
+    echo "  PV capacity:        $(longhorn_display_value "$pv_capacity")"
+    echo "  Current volume size: $(longhorn_display_value "$current_volume_size")"
+    echo "  Backup size:        $(longhorn_display_value "$selected_backup_size") bytes"
+    echo "  Backup source:      $selected_source"
+    echo "  Selected backup:    $selected_backup"
+    echo ""
+
+    local workloads=() pods=()
+    mapfile -t workloads < <(longhorn_pvc_workloads "$target_namespace" "$target_pvc")
+    mapfile -t pods < <(longhorn_pvc_pods "$target_namespace" "$target_pvc")
+    if [ "${#workloads[@]}" -eq 0 ]; then
+        print_error "No Deployment, StatefulSet, or DaemonSet declares this PVC."
+        print_info "The application may not be deployed yet. Use 'Restore as a new PVC' instead."
+        return 1
+    fi
+    print_info "Workloads declaring the PVC: ${workloads[*]}"
+    if [ "${#pods[@]}" -gt 0 ]; then
+        print_warning "Pods currently using the PVC: ${pods[*]}"
+    else
+        print_successful "No running pods currently use the PVC."
+    fi
+
+    longhorn_validate_flux_pause "$target_namespace" "$target_pvc" || return 1
+
+    local workload_replicas=() workload kind replicas
+    for workload in "${workloads[@]}"; do
+        kind="${workload%%/*}"
+        if [ "$kind" = "daemonset" ]; then
+            if [ "${#pods[@]}" -gt 0 ]; then
+                print_error "DaemonSet ${workload} still uses the PVC. Stop it manually before continuing."
+                return 1
+            fi
+            workload_replicas+=("-")
+            continue
+        fi
+        replicas=$(longhorn_kubectl get "$workload" -n "$target_namespace" -o jsonpath='{.spec.replicas}' 2>/dev/null)
+        workload_replicas+=("${replicas:-1}")
+    done
+    LONGHORN_RESTORE_WORKLOADS=("${workloads[@]}")
+    LONGHORN_RESTORE_WORKLOAD_REPLICAS=("${workload_replicas[@]}")
+    LONGHORN_RESTORE_WORKLOAD_NAMESPACE="$target_namespace"
+    LONGHORN_RESTORE_WORKLOADS_SCALED=n
+
+    if [ "${#pods[@]}" -gt 0 ]; then
+        prompt_yn scale_down "Scale the listed Deployment/StatefulSet workloads to zero now? (y/n): " "n" || return 1
+        [ "$scale_down" = "y" ] || { print_error "Restore cancelled while pods are still using the PVC."; return 1; }
+        LONGHORN_RESTORE_WORKLOADS_SCALED=y
+        for workload in "${workloads[@]}"; do
+            kind="${workload%%/*}"
+            if [ "$kind" = "deployment" ] || [ "$kind" = "statefulset" ]; then
+                longhorn_kubectl scale "$workload" -n "$target_namespace" --replicas=0 || return 1
+            fi
+        done
+        longhorn_wait_for_pvc_pods_gone "$target_namespace" "$target_pvc" 180 || return 1
+    fi
+
+    longhorn_wait_for_volume_detached "$pv_handle" 180 || return 1
+    if printf '%s' "$selected_backup_size" | grep -Eq '^[0-9]+$' && printf '%s' "$current_volume_size" | grep -Eq '^[0-9]+$' && [ "$selected_backup_size" -ne "$current_volume_size" ]; then
+        print_error "Backup size does not match the existing volume size."
+        print_info "Existing: ${current_volume_size} bytes; backup: ${selected_backup_size} bytes."
+        print_info "Use the standard new-volume restore path for a size change."
+        return 1
+    fi
+
+    local state_prefix state_file restore_manifest
+    state_prefix=$(sanitize_k8s_name "${target_namespace}-${target_pvc}-${selected_backup}")
+    state_file="./longhorn-existing-restore-${state_prefix}.state"
+    restore_manifest="./longhorn-existing-restore-${state_prefix}.yaml"
+    {
+        echo "created_at=$(date -Iseconds 2>/dev/null || date)"
+        echo "namespace=$target_namespace"
+        echo "pvc=$target_pvc"
+        echo "pv=$pv_name"
+        echo "volume_handle=$pv_handle"
+        echo "backup=$selected_backup"
+        echo "backup_source=$selected_source"
+        echo "backup_url=$backup_url"
+        echo "backup_size=$selected_backup_size"
+        echo "replicas=$current_volume_replicas"
+        echo "data_engine=$current_volume_engine"
+        echo "access_mode=$current_volume_access_mode"
+        echo "storage_class=$pvc_storage_class"
+    } > "$state_file"
+    longhorn_kubectl get pvc "$target_pvc" -n "$target_namespace" -o yaml >> "$state_file" 2>/dev/null || true
+    longhorn_kubectl get pv "$pv_name" -o yaml >> "$state_file" 2>/dev/null || true
+
+    cat > "$restore_manifest" << EOF
+apiVersion: longhorn.io/v1beta2
+kind: Volume
+metadata:
+  name: ${pv_handle}
+  namespace: longhorn-system
+spec:
+  size: "${selected_backup_size}"
+  fromBackup: "${backup_url}"
+  numberOfReplicas: ${current_volume_replicas}
+  frontend: blockdev
+  dataEngine: ${current_volume_engine}
+  accessMode: ${current_volume_access_mode}
+EOF
+
+    print_warning "The empty Longhorn volume ${pv_handle} will be deleted and replaced with the selected old backup."
+    print_warning "The existing PV/PVC are expected to remain unchanged and continue pointing to ${pv_handle}."
+    echo "  State record:   $state_file"
+    echo "  Restore file:   $restore_manifest"
+    echo "  Existing PV:    $pv_name"
+    echo "  Existing PVC:   ${target_namespace}/${target_pvc}"
+    echo ""
+    read -p "Type REPLACE to delete the empty volume and restore the old backup: " replace_confirm
+    if [ "$replace_confirm" != "REPLACE" ]; then
+        print_info "Restore cancelled before changing the cluster."
+        return 0
+    fi
+
+    longhorn_validate_flux_suspended || return 1
+
+    if ! longhorn_kubectl delete volume "$pv_handle" -n longhorn-system --wait=true --timeout=180s; then
+        print_error "Could not delete the existing empty Longhorn volume. Nothing was restored."
+        return 1
+    fi
+    if longhorn_kubectl get volume "$pv_handle" -n longhorn-system &>/dev/null; then
+        print_error "The old Longhorn volume still exists. Restore was not attempted."
+        return 1
+    fi
+    if ! longhorn_kubectl get pv "$pv_name" &>/dev/null || ! longhorn_kubectl get pvc "$target_pvc" -n "$target_namespace" &>/dev/null; then
+        print_error "The existing PV/PVC did not remain available after volume deletion."
+        print_info "Use the saved state record to recover the binding: $state_file"
+        return 1
+    fi
+
+    longhorn_kubectl apply -f "$restore_manifest" || return 1
+    print_successful "Restore requested using the existing PV volume handle: $pv_handle"
+    longhorn_wait_for_restore_detached "$pv_handle" 1800 || return 1
+
+    local restored_handle restored_phase
+    restored_handle=$(longhorn_kubectl get pv "$pv_name" -o jsonpath='{.spec.csi.volumeHandle}' 2>/dev/null)
+    restored_phase=$(longhorn_kubectl get pvc "$target_pvc" -n "$target_namespace" -o jsonpath='{.status.phase}' 2>/dev/null)
+    if [ "$restored_handle" != "$pv_handle" ] || [ "$restored_phase" != "Bound" ]; then
+        print_error "PV/PVC validation failed after restore."
+        echo "  PV handle: $restored_handle"
+        echo "  PVC phase: $restored_phase"
+        print_info "The saved state record is available at: $state_file"
+        return 1
+    fi
+    print_successful "Existing PV/PVC binding is intact: ${target_namespace}/${target_pvc} -> ${pv_name} -> ${pv_handle}"
+    print_successful "Storage restore completed; cleanup will restore workloads and Flux reconciliation."
+    return 0
+}
+
+longhorn_restore_into_existing_pvc() {
+    LONGHORN_FLUX_GUARDED_KINDS=()
+    LONGHORN_FLUX_GUARDED_NAMES=()
+    LONGHORN_FLUX_GUARDED_NAMESPACES=()
+    LONGHORN_FLUX_CHANGED_KINDS=()
+    LONGHORN_FLUX_CHANGED_NAMES=()
+    LONGHORN_FLUX_CHANGED_NAMESPACES=()
+    LONGHORN_RESTORE_WORKLOADS=()
+    LONGHORN_RESTORE_WORKLOAD_REPLICAS=()
+    LONGHORN_RESTORE_WORKLOAD_NAMESPACE=""
+    LONGHORN_RESTORE_TARGET_NAMESPACE=""
+    LONGHORN_RESTORE_TARGET_PVC=""
+    LONGHORN_RESTORE_WORKLOADS_SCALED=n
+
+    longhorn_restore_into_existing_pvc_impl
+    local restore_result=$?
+    local cleanup_result=0
+
+    if ! longhorn_restore_workloads; then
+        cleanup_result=1
+    fi
+    if ! longhorn_resume_flux_resources; then
+        cleanup_result=1
+    elif ! longhorn_wait_for_flux_ready; then
+        cleanup_result=1
+    fi
+
+    if [ "$restore_result" -eq 0 ] && [ "$cleanup_result" -eq 0 ]; then
+        print_info "Verify the application after Flux reconciliation:"
+        echo "  kubectl -n ${LONGHORN_RESTORE_TARGET_NAMESPACE:-<namespace>} get pvc ${LONGHORN_RESTORE_TARGET_PVC:-<pvc-name>}"
+        echo "  kubectl -n ${LONGHORN_RESTORE_TARGET_NAMESPACE:-<namespace>} get pods -o wide"
+        print_successful "Application storage restore finished without changing the application PVC name or manifest."
+    elif [ "$cleanup_result" -ne 0 ]; then
+        print_error "Restore cleanup was incomplete. Check workload replicas and Flux suspension state manually."
+    fi
+    [ "$restore_result" -eq 0 ] && [ "$cleanup_result" -eq 0 ]
 }
 
 longhorn_selective_restore() {
@@ -4385,23 +5041,22 @@ EOF
 manage_longhorn() {
     while true; do
         echo -e "${YELLOW}======== Longhorn Backup / Restore ========${NC}"
-        echo "1. Check Longhorn backup target"
+        echo "1. Check old backup target and inventory"
         echo "2. List backup inventory"
-        echo "3. Selective restore latest backup"
-        echo "4. Check restore / volume status"
-        echo "5. Back to Main Menu"
+        echo "3. Restore into existing application PVC"
+        echo "4. Restore as a new PVC"
+        echo "5. Check restore / volume status"
+        echo "6. Back to Main Menu"
         echo -e "${YELLOW}==========================================${NC}"
         read -p "Enter your choice: " longhorn_choice
 
         case $longhorn_choice in
-            1)
-                longhorn_require_cluster || continue
-                longhorn_kubectl get backuptargets.longhorn.io -n longhorn-system
-                ;;
+            1) longhorn_check_old_backup_target ;;
             2) longhorn_list_backup_inventory ;;
-            3) longhorn_selective_restore ;;
-            4) longhorn_restore_status ;;
-            5) return ;;
+            3) longhorn_restore_into_existing_pvc ;;
+            4) longhorn_selective_restore ;;
+            5) longhorn_restore_status ;;
+            6) return ;;
             "") continue ;;
             *) print_error "Invalid option." ;;
         esac
