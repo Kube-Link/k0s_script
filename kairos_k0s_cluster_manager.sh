@@ -47,7 +47,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.71"
+SCRIPT_VERSION="1.0.72"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -553,6 +553,18 @@ show_config_file() {
         print_error "Config file $CONFIG_FILE not found."
         read -p "Create one now? (y/n): " create_config
         [ "$create_config" = "y" ] && generate_config_file
+    fi
+}
+
+show_kubeconfig() {
+    if [ -f "$K0S_KUBECONFIG" ]; then
+        echo -e "${YELLOW}======== k0s Kubeconfig (${K0S_KUBECONFIG}) ========${NC}"
+        cat "$K0S_KUBECONFIG"
+        echo -e "${YELLOW}===================================================${NC}"
+    else
+        print_error "k0s kubeconfig not found at ${K0S_KUBECONFIG}."
+        print_info "This file exists only on a k0s controller node."
+        print_info "To retrieve it remotely: scp user@<controller>:/var/lib/k0s/pki/admin.conf ~/.kube/config"
     fi
 }
 
@@ -5173,7 +5185,8 @@ while true; do
     echo "14. Rolling OS Upgrade (A/B)"
     echo "15. Update Script Now (no reboot)"
     echo "16. Show Config File"
-    echo "17. Exit"
+    echo "17. Cat Kubeconfig"
+    echo "18. Exit"
     echo -e "${YELLOW}=================================================${NC}"
     if ! read -p "Enter your choice: " choice; then
         echo ""
@@ -5198,7 +5211,8 @@ while true; do
         14) kairos_rolling_upgrade ;;
         15) update_script_now ;;
         16) show_config_file ;;
-        17) echo "Exiting..."; exit 0 ;;
+        17) show_kubeconfig ;;
+        18) echo "Exiting..."; exit 0 ;;
         "") continue ;;
         *) print_error "Invalid option." ;;
     esac
