@@ -2,6 +2,7 @@
 *.cfg
 *.yaml
 *.yml
+/bgp_config/
 
 # Reference scripts (not part of this project)
 ref/

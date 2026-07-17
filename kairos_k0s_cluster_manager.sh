@@ -47,7 +47,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.72"
+SCRIPT_VERSION="1.0.73"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -2026,6 +2026,9 @@ install_cilium() {
         --set autoDirectNodeRoutes=true
         --set bpf.masquerade=true
         --set bgpControlPlane.enabled=true
+        --set l2announcements.enabled=true
+        --set k8sClientRateLimit.qps="${CILIUM_L2_CLIENT_QPS:-20}"
+        --set k8sClientRateLimit.burst="${CILIUM_L2_CLIENT_BURST:-40}"
         --set hubble.relay.enabled=false
         --set hubble.enabled=false
         --set hubble.ui.enabled=false
@@ -3529,6 +3532,18 @@ spec:
       stop: "$LB_IP_END"
 EOF
 
+    printf '%s\n' \
+        'apiVersion: cilium.io/v2alpha1' \
+        'kind: CiliumL2AnnouncementPolicy' \
+        'metadata:' \
+        '  name: l2-loadbalancer' \
+        'spec:' \
+        '  serviceSelector:' \
+        '    matchExpressions:' \
+        '      - { key: bgp, operator: In, values: [ external ] }' \
+        '  loadBalancerIPs: true' \
+        > ./bgp_config/CiliumL2AnnouncementPolicy.yaml
+
     print_successful "BGP configuration files generated in ./bgp_config/ directory"
 
     if [ -f "$CONFIG_FILE" ]; then
@@ -3550,7 +3565,9 @@ apply_bgp_config() {
         return 1
     fi
 
-    if [ ! -d "./bgp_config" ] || [ ! -f "./bgp_config/CiliumBGPClusterConfig.yaml" ]; then
+    if [ ! -d "./bgp_config" ] || \
+        [ ! -f "./bgp_config/CiliumBGPClusterConfig.yaml" ] || \
+        [ ! -f "./bgp_config/CiliumL2AnnouncementPolicy.yaml" ]; then
         print_error "BGP configuration files not found. Generate them first."
         read -p "Generate BGP configuration now? (y/n): " generate_config
         [ "$generate_config" = "y" ] && generate_bgp_config || return 1
@@ -3558,6 +3575,9 @@ apply_bgp_config() {
 
     print_info "Applying CiliumLoadBalancerIPPool..."
     k0s_kubectl apply -f ./bgp_config/CiliumLoadBalancerIPPool.yaml
+
+    print_info "Applying CiliumL2AnnouncementPolicy..."
+    k0s_kubectl apply -f ./bgp_config/CiliumL2AnnouncementPolicy.yaml
 
     print_info "Applying CiliumBGPPeerConfig..."
     k0s_kubectl apply -f ./bgp_config/CiliumBGPPeerConfig.yaml
@@ -3569,7 +3589,7 @@ apply_bgp_config() {
     k0s_kubectl apply -f ./bgp_config/CiliumBGPClusterConfig.yaml
 
     print_successful "BGP configuration applied to the cluster"
-    print_info "Run 'k0s_kubectl get ciliumloadbalancerippool,ciliumbgppeerconfig,ciliumbgpadvertisement,ciliumbgpclusterconfig' to verify"
+    print_info "Run 'k0s_kubectl get ciliumloadbalancerippool,ciliuml2announcementpolicy,ciliumbgppeerconfig,ciliumbgpadvertisement,ciliumbgpclusterconfig' to verify"
 }
 
 generate_unifi_config() {
@@ -3657,7 +3677,7 @@ check_bgp_status() {
     fi
 
     print_info "Checking Cilium BGP resources..."
-    k0s_kubectl get ciliumloadbalancerippool,ciliumbgppeerconfig,ciliumbgpadvertisement,ciliumbgpclusterconfig
+    k0s_kubectl get ciliumloadbalancerippool,ciliuml2announcementpolicy,ciliumbgppeerconfig,ciliumbgpadvertisement,ciliumbgpclusterconfig
 
     if command -v cilium &> /dev/null; then
         print_info "Checking detailed BGP status with Cilium CLI..."
