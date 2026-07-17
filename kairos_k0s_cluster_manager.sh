@@ -47,7 +47,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.73"
+SCRIPT_VERSION="1.0.74"
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -3392,11 +3392,18 @@ upgrade_cilium() {
 
     read -p "Enter specific Cilium version to upgrade to (leave empty for latest): " CILIUM_VERSION
 
-    local VERSION_FLAG=""
-    [ -n "$CILIUM_VERSION" ] && VERSION_FLAG="--version $CILIUM_VERSION"
+    local upgrade_args=(
+        --kubeconfig "$K0S_KUBECONFIG"
+        --reuse-values
+        --set l2announcements.enabled=true
+        --set k8sClientRateLimit.qps="${CILIUM_L2_CLIENT_QPS:-20}"
+        --set k8sClientRateLimit.burst="${CILIUM_L2_CLIENT_BURST:-40}"
+    )
 
-    print_info "Upgrading Cilium in cluster..."
-    if ! cilium upgrade --kubeconfig "$K0S_KUBECONFIG" $VERSION_FLAG; then
+    [ -n "$CILIUM_VERSION" ] && upgrade_args+=(--version "$CILIUM_VERSION")
+
+    print_info "Upgrading Cilium in cluster and applying L2 announcement configuration..."
+    if ! cilium upgrade "${upgrade_args[@]}"; then
         print_error "Cilium upgrade failed."
         return 1
     fi
