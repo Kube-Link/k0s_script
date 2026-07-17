@@ -47,7 +47,18 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.74"
+SCRIPT_VERSION="1.0.75"
+
+printf -v LONGHORN_DM_CRYPT_BOOT_BLOCK '%s\n' \
+'    - name: "Load dm_crypt for Longhorn"' \
+'      commands:' \
+'        - |' \
+'          mkdir -p /etc/modules-load.d' \
+'          printf "%s\\n" dm_crypt > /etc/modules-load.d/longhorn.conf' \
+'          if ! modprobe dm_crypt; then' \
+'            echo "Longhorn requires the dm_crypt kernel module; it is missing from $(uname -r)." >&2' \
+'            exit 1' \
+'          fi'
 
 # Cluster defaults
 DEFAULT_POD_CIDR="10.42.0.0/16"
@@ -610,6 +621,10 @@ generate_controller_cloudconfig() {
 
     # Optional install block — enables zero-touch provisioning
     local INSTALL_BLOCK=""
+    local LONGHORN_BOOT_BLOCK=""
+    if [ "${CONTROLLER_WORKER:-n}" = "y" ]; then
+        LONGHORN_BOOT_BLOCK="$LONGHORN_DM_CRYPT_BOOT_BLOCK"
+    fi
     read -p "Enable auto-install (zero-touch, formats /dev/sda and reboots)? (y/n, default: n): " AUTO_INSTALL
     if [ "${AUTO_INSTALL:-n}" = "y" ]; then
         read -p "Install device (default: /dev/sda): " INSTALL_DEVICE
@@ -891,6 +906,7 @@ stages:
     - name: "Update cluster manager script safely"
       commands:
         - ${SAFE_SCRIPT_UPDATE_COMMAND}
+${LONGHORN_BOOT_BLOCK}
 # Longhorn requirement
   boot.after:
     - name: "Enable iSCSI"
@@ -1044,6 +1060,7 @@ stages:
     - name: "Update cluster manager script safely"
       commands:
         - ${SAFE_SCRIPT_UPDATE_COMMAND}
+${LONGHORN_DM_CRYPT_BOOT_BLOCK}
   boot.after:
     - name: "Enable iSCSI"
       commands:
@@ -1207,6 +1224,10 @@ generate_controller_join_cloudconfig() {
   nousers: true
   grub_options:
     extra_cmdline: \"rd.neednet=1\""
+    local LONGHORN_BOOT_BLOCK=""
+    if [ "${CONTROLLER_WORKER:-n}" = "y" ]; then
+        LONGHORN_BOOT_BLOCK="$LONGHORN_DM_CRYPT_BOOT_BLOCK"
+    fi
 
     # Use the same dedicated management key on every controller.
     prepare_controller_management_key || true
@@ -1463,6 +1484,7 @@ stages:
     - name: "Update cluster manager script safely"
       commands:
         - ${SAFE_SCRIPT_UPDATE_COMMAND}
+${LONGHORN_BOOT_BLOCK}
   boot.after:
     - name: "Enable iSCSI"
       commands:
