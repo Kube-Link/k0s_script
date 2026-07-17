@@ -47,7 +47,15 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.75"
+SCRIPT_VERSION="1.0.76"
+
+printf -v LONGHORN_MULTIPATH_BOOT_BLOCK '%s\n' \
+'    - name: "Disable multipathd for Longhorn"' \
+'      commands:' \
+'        - |' \
+'          for unit in multipathd.service multipathd.socket; do' \
+'            systemctl disable --now "$unit" 2>/dev/null || true' \
+'          done'
 
 printf -v LONGHORN_DM_CRYPT_BOOT_BLOCK '%s\n' \
 '    - name: "Load dm_crypt for Longhorn"' \
@@ -623,7 +631,7 @@ generate_controller_cloudconfig() {
     local INSTALL_BLOCK=""
     local LONGHORN_BOOT_BLOCK=""
     if [ "${CONTROLLER_WORKER:-n}" = "y" ]; then
-        LONGHORN_BOOT_BLOCK="$LONGHORN_DM_CRYPT_BOOT_BLOCK"
+        LONGHORN_BOOT_BLOCK="${LONGHORN_MULTIPATH_BOOT_BLOCK}${LONGHORN_DM_CRYPT_BOOT_BLOCK}"
     fi
     read -p "Enable auto-install (zero-touch, formats /dev/sda and reboots)? (y/n, default: n): " AUTO_INSTALL
     if [ "${AUTO_INSTALL:-n}" = "y" ]; then
@@ -1060,6 +1068,7 @@ stages:
     - name: "Update cluster manager script safely"
       commands:
         - ${SAFE_SCRIPT_UPDATE_COMMAND}
+${LONGHORN_MULTIPATH_BOOT_BLOCK}
 ${LONGHORN_DM_CRYPT_BOOT_BLOCK}
   boot.after:
     - name: "Enable iSCSI"
@@ -1226,7 +1235,7 @@ generate_controller_join_cloudconfig() {
     extra_cmdline: \"rd.neednet=1\""
     local LONGHORN_BOOT_BLOCK=""
     if [ "${CONTROLLER_WORKER:-n}" = "y" ]; then
-        LONGHORN_BOOT_BLOCK="$LONGHORN_DM_CRYPT_BOOT_BLOCK"
+        LONGHORN_BOOT_BLOCK="${LONGHORN_MULTIPATH_BOOT_BLOCK}${LONGHORN_DM_CRYPT_BOOT_BLOCK}"
     fi
 
     # Use the same dedicated management key on every controller.
