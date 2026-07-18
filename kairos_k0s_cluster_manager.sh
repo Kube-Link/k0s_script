@@ -47,16 +47,12 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-<<<<<<< HEAD
 SCRIPT_VERSION="1.0.78"
 
 # Flux bootstrap defaults. These are saved to the cluster config after the
 # first interactive bootstrap so upgrades can reuse the exact same component set.
 FLUX_DEFAULT_COMPONENTS=(source-controller kustomize-controller helm-controller notification-controller)
 FLUX_DEFAULT_COMPONENTS_EXTRA=(image-reflector-controller image-automation-controller)
-=======
-SCRIPT_VERSION="1.0.77"
->>>>>>> 88b59aa5f824f1bee4b7070f627fa6f769a4c654
 
 printf -v LONGHORN_MULTIPATH_BOOT_BLOCK '%s\n' \
 '    - name: "Disable multipathd for Longhorn"' \
