@@ -47,7 +47,12 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.76"
+SCRIPT_VERSION="1.0.78"
+
+# Flux bootstrap defaults. These are saved to the cluster config after the
+# first interactive bootstrap so upgrades can reuse the exact same component set.
+FLUX_DEFAULT_COMPONENTS=(source-controller kustomize-controller helm-controller notification-controller)
+FLUX_DEFAULT_COMPONENTS_EXTRA=(image-reflector-controller image-automation-controller)
 
 printf -v LONGHORN_MULTIPATH_BOOT_BLOCK '%s\n' \
 '    - name: "Disable multipathd for Longhorn"' \
@@ -380,6 +385,29 @@ generate_config_file() {
     print_info "Generating Kairos/k0s config file..."
     echo ""
     local tmp_config="${CONFIG_FILE}.tmp.$$"
+    local saved_flux_bootstrap_mode=""
+    local saved_flux_github_owner=""
+    local saved_flux_github_repository=""
+    local saved_flux_github_branch=""
+    local saved_flux_github_path=""
+    local saved_flux_github_personal=""
+    local -a saved_flux_components=()
+    local -a saved_flux_components_extra=()
+
+    if [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE" 2>/dev/null; then
+        saved_flux_bootstrap_mode="${FLUX_BOOTSTRAP_MODE:-}"
+        saved_flux_github_owner="${FLUX_GITHUB_OWNER:-}"
+        saved_flux_github_repository="${FLUX_GITHUB_REPOSITORY:-}"
+        saved_flux_github_branch="${FLUX_GITHUB_BRANCH:-}"
+        saved_flux_github_path="${FLUX_GITHUB_PATH:-}"
+        saved_flux_github_personal="${FLUX_GITHUB_PERSONAL:-}"
+        if declare -p FLUX_COMPONENTS >/dev/null 2>&1; then
+            saved_flux_components=("${FLUX_COMPONENTS[@]}")
+        fi
+        if declare -p FLUX_COMPONENTS_EXTRA >/dev/null 2>&1; then
+            saved_flux_components_extra=("${FLUX_COMPONENTS_EXTRA[@]}")
+        fi
+    fi
     rm -f "$tmp_config"
 
     # --- Cluster topology ---
@@ -549,6 +577,17 @@ generate_config_file() {
     write_config_value "$tmp_config" "INSTALL_CILIUM" "$INSTALL_CILIUM"
     write_config_value "$tmp_config" "GITHUB_USER" "$GITHUB_USER"
     write_config_value "$tmp_config" "SSH_PUBKEY" "$SSH_PUBKEY"
+
+    if [ -n "$saved_flux_bootstrap_mode" ]; then
+        write_config_value "$tmp_config" "FLUX_BOOTSTRAP_MODE" "$saved_flux_bootstrap_mode"
+        write_config_value "$tmp_config" "FLUX_GITHUB_OWNER" "$saved_flux_github_owner"
+        write_config_value "$tmp_config" "FLUX_GITHUB_REPOSITORY" "$saved_flux_github_repository"
+        write_config_value "$tmp_config" "FLUX_GITHUB_BRANCH" "$saved_flux_github_branch"
+        write_config_value "$tmp_config" "FLUX_GITHUB_PATH" "$saved_flux_github_path"
+        write_config_value "$tmp_config" "FLUX_GITHUB_PERSONAL" "$saved_flux_github_personal"
+        write_config_array "$tmp_config" "FLUX_COMPONENTS" "${saved_flux_components[@]}"
+        write_config_array "$tmp_config" "FLUX_COMPONENTS_EXTRA" "${saved_flux_components_extra[@]}"
+    fi
 
     if ! validate_config_file "$tmp_config"; then
         print_error "New config failed validation. Existing $CONFIG_FILE was not changed."
@@ -902,6 +941,14 @@ ${CONTROLLER_MANAGEMENT_WRITE_FILES_BLOCK}
       INSTALL_CILIUM=${INSTALL_CILIUM}
       GITHUB_USER=${GITHUB_USER}
       SSH_PUBKEY='${SSH_PUBKEY}'
+      FLUX_BOOTSTRAP_MODE=${FLUX_BOOTSTRAP_MODE:-}
+      FLUX_GITHUB_OWNER=${FLUX_GITHUB_OWNER:-}
+      FLUX_GITHUB_REPOSITORY=${FLUX_GITHUB_REPOSITORY:-}
+      FLUX_GITHUB_BRANCH=${FLUX_GITHUB_BRANCH:-}
+      FLUX_GITHUB_PATH=${FLUX_GITHUB_PATH:-}
+      FLUX_GITHUB_PERSONAL=${FLUX_GITHUB_PERSONAL:-}
+      FLUX_COMPONENTS=(${FLUX_COMPONENTS[@]})
+      FLUX_COMPONENTS_EXTRA=(${FLUX_COMPONENTS_EXTRA[@]})
 
 # Persistent paths — survive reboots and OS upgrades (read-write bind mounts)
 # k0s state and kubelet must persist on an immutable OS
@@ -1057,6 +1104,14 @@ write_files:
       INSTALL_CILIUM=${INSTALL_CILIUM}
       GITHUB_USER=${GITHUB_USER}
       SSH_PUBKEY='${SSH_PUBKEY}'
+      FLUX_BOOTSTRAP_MODE=${FLUX_BOOTSTRAP_MODE:-}
+      FLUX_GITHUB_OWNER=${FLUX_GITHUB_OWNER:-}
+      FLUX_GITHUB_REPOSITORY=${FLUX_GITHUB_REPOSITORY:-}
+      FLUX_GITHUB_BRANCH=${FLUX_GITHUB_BRANCH:-}
+      FLUX_GITHUB_PATH=${FLUX_GITHUB_PATH:-}
+      FLUX_GITHUB_PERSONAL=${FLUX_GITHUB_PERSONAL:-}
+      FLUX_COMPONENTS=(${FLUX_COMPONENTS[@]})
+      FLUX_COMPONENTS_EXTRA=(${FLUX_COMPONENTS_EXTRA[@]})
 
 # Persistent paths — survive reboots and OS upgrades (read-write bind mounts)
 bind_mounts:
@@ -1483,6 +1538,14 @@ ${CONTROLLER_MANAGEMENT_WRITE_FILES_BLOCK}
       INSTALL_CILIUM=${INSTALL_CILIUM}
       GITHUB_USER=${GITHUB_USER}
       SSH_PUBKEY='${SSH_PUBKEY}'
+      FLUX_BOOTSTRAP_MODE=${FLUX_BOOTSTRAP_MODE:-}
+      FLUX_GITHUB_OWNER=${FLUX_GITHUB_OWNER:-}
+      FLUX_GITHUB_REPOSITORY=${FLUX_GITHUB_REPOSITORY:-}
+      FLUX_GITHUB_BRANCH=${FLUX_GITHUB_BRANCH:-}
+      FLUX_GITHUB_PATH=${FLUX_GITHUB_PATH:-}
+      FLUX_GITHUB_PERSONAL=${FLUX_GITHUB_PERSONAL:-}
+      FLUX_COMPONENTS=(${FLUX_COMPONENTS[@]})
+      FLUX_COMPONENTS_EXTRA=(${FLUX_COMPONENTS_EXTRA[@]})
 # Persistent paths
 bind_mounts:
   - /var/lib/k0s
@@ -3953,68 +4016,510 @@ remove_fluxcd_controller() {
     print_successful "$CONTROLLER_NAME removed successfully"
 }
 
-upgrade_fluxcd() {
-    print_info "Upgrading FluxCD..."
+flux_array_contains() {
+    local needle="$1"
+    shift
+    local value
+    for value in "$@"; do
+        [ "$value" = "$needle" ] && return 0
+    done
+    return 1
+}
 
-    if ! command -v flux &> /dev/null; then
-        print_info "Flux CLI not found. Downloading and installing..."
-        curl -s https://fluxcd.io/install.sh | sudo bash
-    else
-        print_info "Upgrading Flux CLI to the latest version..."
-        curl -s https://fluxcd.io/install.sh | sudo bash
-        print_successful "Flux CLI upgraded to the latest version"
+flux_join_csv() {
+    local IFS=,
+    printf '%s' "$*"
+}
+
+flux_load_bootstrap_settings() {
+    if [ -f "$CONFIG_FILE" ]; then
+        # The cluster config is already validated before normal workflows.
+        # Loading it here also supports older configs without Flux keys.
+        source "$CONFIG_FILE"
     fi
 
-    read -p "Enter specific FluxCD version to upgrade to (leave empty for latest): " FLUX_VERSION
+    if ! declare -p FLUX_COMPONENTS >/dev/null 2>&1 || [ "${#FLUX_COMPONENTS[@]}" -eq 0 ]; then
+        FLUX_COMPONENTS=("${FLUX_DEFAULT_COMPONENTS[@]}")
+    fi
+    if ! declare -p FLUX_COMPONENTS_EXTRA >/dev/null 2>&1; then
+        FLUX_COMPONENTS_EXTRA=("${FLUX_DEFAULT_COMPONENTS_EXTRA[@]}")
+    fi
 
-    VERSION_FLAG=""
-    [ -n "$FLUX_VERSION" ] && VERSION_FLAG="--version $FLUX_VERSION"
+    FLUX_GITHUB_PERSONAL=${FLUX_GITHUB_PERSONAL:-y}
+}
 
-    print_info "Upgrading FluxCD controllers..."
-    KUBECONFIG="$K0S_KUBECONFIG" flux install $VERSION_FLAG
+flux_save_bootstrap_settings() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        print_warning "Config file not found; Flux settings were not persisted."
+        return 0
+    fi
 
-    print_successful "FluxCD upgrade completed"
-    print_info "Run 'flux get all' to verify the upgrade"
+    upsert_config_value "$CONFIG_FILE" "FLUX_BOOTSTRAP_MODE" "${FLUX_BOOTSTRAP_MODE:-github}"
+    upsert_config_value "$CONFIG_FILE" "FLUX_GITHUB_OWNER" "${FLUX_GITHUB_OWNER:-}"
+    upsert_config_value "$CONFIG_FILE" "FLUX_GITHUB_REPOSITORY" "${FLUX_GITHUB_REPOSITORY:-}"
+    upsert_config_value "$CONFIG_FILE" "FLUX_GITHUB_BRANCH" "${FLUX_GITHUB_BRANCH:-main}"
+    upsert_config_value "$CONFIG_FILE" "FLUX_GITHUB_PATH" "${FLUX_GITHUB_PATH:-cluster}"
+    upsert_config_value "$CONFIG_FILE" "FLUX_GITHUB_PERSONAL" "${FLUX_GITHUB_PERSONAL:-y}"
+    upsert_config_array "$CONFIG_FILE" "FLUX_COMPONENTS" "${FLUX_COMPONENTS[@]}"
+    upsert_config_array "$CONFIG_FILE" "FLUX_COMPONENTS_EXTRA" "${FLUX_COMPONENTS_EXTRA[@]}"
+    print_successful "Flux bootstrap settings saved to $CONFIG_FILE (credentials were not saved)."
+}
+
+show_flux_bootstrap_settings() {
+    flux_load_bootstrap_settings
+
+    echo -e "${YELLOW}======== Saved Flux Bootstrap Settings ========${NC}"
+    echo "Mode: ${FLUX_BOOTSTRAP_MODE:-not configured}"
+    echo "GitHub owner: ${FLUX_GITHUB_OWNER:-not configured}"
+    echo "Repository: ${FLUX_GITHUB_REPOSITORY:-not configured}"
+    echo "Branch: ${FLUX_GITHUB_BRANCH:-main}"
+    echo "Cluster path: ${FLUX_GITHUB_PATH:-cluster}"
+    echo "Personal repository: ${FLUX_GITHUB_PERSONAL:-y}"
+    echo "Components: $(flux_join_csv "${FLUX_COMPONENTS[@]}")"
+    echo "Extra components: $(flux_join_csv "${FLUX_COMPONENTS_EXTRA[@]}")"
+    echo "GitHub token: not stored"
+    echo -e "${YELLOW}==============================================${NC}"
+}
+
+install_or_update_flux_cli() {
+    local installer
+
+    installer=$(mktemp "${TMPDIR:-/tmp}/flux-install.XXXXXX") || {
+        print_error "Could not create a temporary file for the Flux CLI installer."
+        return 1
+    }
+
+    print_info "Installing/updating the Flux CLI..."
+    if ! curl -fsSL https://fluxcd.io/install.sh -o "$installer" || ! sudo bash "$installer"; then
+        rm -f "$installer"
+        print_error "Flux CLI installation/update failed."
+        return 1
+    fi
+    rm -f "$installer"
+
+    if ! command -v flux >/dev/null 2>&1; then
+        print_error "Flux CLI is still not available in PATH."
+        return 1
+    fi
+    print_successful "Flux CLI ready: $(flux --version 2>/dev/null | head -n 1)"
+}
+
+prompt_flux_component_selection() {
+    local standard_selection
+    local extra_selection
+    local choice
+    local -a choices
+
+    echo ""
+    print_info "Standard Flux controllers:"
+    echo "  1. source-controller (required)"
+    echo "  2. kustomize-controller (required)"
+    echo "  3. helm-controller (recommended for HelmRelease resources)"
+    echo "  4. notification-controller"
+    echo "Current: $(flux_join_csv "${FLUX_COMPONENTS[@]}")"
+    read -r -p "Select standard controllers by number, or press Enter to keep current: " standard_selection || return 1
+
+    if [ -n "$standard_selection" ]; then
+        if [[ "$standard_selection" =~ ^[Nn][Oo][Nn][Ee]$ || "$standard_selection" = "0" ]]; then
+            FLUX_COMPONENTS=()
+        else
+            FLUX_COMPONENTS=()
+            IFS=',' read -ra choices <<< "$standard_selection"
+            for choice in "${choices[@]}"; do
+                choice=$(trim_value "$choice")
+                case "$choice" in
+                    1) flux_array_contains source-controller "${FLUX_COMPONENTS[@]}" || FLUX_COMPONENTS+=(source-controller) ;;
+                    2) flux_array_contains kustomize-controller "${FLUX_COMPONENTS[@]}" || FLUX_COMPONENTS+=(kustomize-controller) ;;
+                    3) flux_array_contains helm-controller "${FLUX_COMPONENTS[@]}" || FLUX_COMPONENTS+=(helm-controller) ;;
+                    4) flux_array_contains notification-controller "${FLUX_COMPONENTS[@]}" || FLUX_COMPONENTS+=(notification-controller) ;;
+                    *) print_error "Invalid standard controller selection: $choice"; return 1 ;;
+                esac
+            done
+        fi
+    fi
+
+    if ! flux_array_contains source-controller "${FLUX_COMPONENTS[@]}" || \
+       ! flux_array_contains kustomize-controller "${FLUX_COMPONENTS[@]}"; then
+        print_error "source-controller and kustomize-controller are required for Flux bootstrap."
+        return 1
+    fi
+
+    if ! flux_array_contains helm-controller "${FLUX_COMPONENTS[@]}"; then
+        local continue_without_helm
+        prompt_yn continue_without_helm "Helm controller is not selected; HelmRelease resources will not reconcile. Continue? (y/n, default: n): " "n" || return 1
+        [ "$continue_without_helm" = "y" ] || return 1
+    fi
+
+    print_info "Optional Flux controllers:"
+    echo "  1. image-reflector-controller"
+    echo "  2. image-automation-controller (requires image-reflector-controller)"
+    echo "Current: $(flux_join_csv "${FLUX_COMPONENTS_EXTRA[@]}")"
+    read -r -p "Select optional controllers by number, 'none', or press Enter to keep current: " extra_selection || return 1
+
+    if [ -n "$extra_selection" ]; then
+        if [[ "$extra_selection" =~ ^[Nn][Oo][Nn][Ee]$ || "$extra_selection" = "0" ]]; then
+            FLUX_COMPONENTS_EXTRA=()
+        else
+            FLUX_COMPONENTS_EXTRA=()
+            IFS=',' read -ra choices <<< "$extra_selection"
+            for choice in "${choices[@]}"; do
+                choice=$(trim_value "$choice")
+                case "$choice" in
+                    1) flux_array_contains image-reflector-controller "${FLUX_COMPONENTS_EXTRA[@]}" || FLUX_COMPONENTS_EXTRA+=(image-reflector-controller) ;;
+                    2) flux_array_contains image-automation-controller "${FLUX_COMPONENTS_EXTRA[@]}" || FLUX_COMPONENTS_EXTRA+=(image-automation-controller) ;;
+                    *) print_error "Invalid optional controller selection: $choice"; return 1 ;;
+                esac
+            done
+        fi
+    fi
+
+    if flux_array_contains image-automation-controller "${FLUX_COMPONENTS_EXTRA[@]}" && \
+       ! flux_array_contains image-reflector-controller "${FLUX_COMPONENTS_EXTRA[@]}"; then
+        FLUX_COMPONENTS_EXTRA=(image-reflector-controller "${FLUX_COMPONENTS_EXTRA[@]}")
+        print_info "image-reflector-controller was added because image automation requires it."
+    fi
+}
+
+prompt_flux_github_settings() {
+    local input
+    local use_saved=y
+
+    flux_load_bootstrap_settings
+    if [ -n "${FLUX_GITHUB_OWNER:-}" ] || [ -n "${FLUX_GITHUB_REPOSITORY:-}" ]; then
+        prompt_yn use_saved "Use saved Flux GitHub settings? (y/n, default: y): " "y" || return 1
+        if [ "$use_saved" = "n" ]; then
+            FLUX_GITHUB_OWNER=""
+            FLUX_GITHUB_REPOSITORY=""
+            FLUX_GITHUB_BRANCH="main"
+            FLUX_GITHUB_PATH="cluster"
+        fi
+    fi
+
+    read -r -p "GitHub owner (user/org) [${FLUX_GITHUB_OWNER:-}]: " input || return 1
+    FLUX_GITHUB_OWNER=$(trim_value "${input:-${FLUX_GITHUB_OWNER:-}}")
+    [ -n "$FLUX_GITHUB_OWNER" ] || { print_error "GitHub owner is required."; return 1; }
+
+    read -r -p "GitHub repository [${FLUX_GITHUB_REPOSITORY:-}]: " input || return 1
+    FLUX_GITHUB_REPOSITORY=$(trim_value "${input:-${FLUX_GITHUB_REPOSITORY:-}}")
+    [ -n "$FLUX_GITHUB_REPOSITORY" ] || { print_error "GitHub repository is required."; return 1; }
+
+    read -r -p "Branch [${FLUX_GITHUB_BRANCH:-main}]: " input || return 1
+    FLUX_GITHUB_BRANCH=$(trim_value "${input:-${FLUX_GITHUB_BRANCH:-main}}")
+
+    read -r -p "Cluster path in repository [${FLUX_GITHUB_PATH:-cluster}]: " input || return 1
+    FLUX_GITHUB_PATH=$(trim_value "${input:-${FLUX_GITHUB_PATH:-cluster}}")
+
+    prompt_yn FLUX_GITHUB_PERSONAL "Is this a personal repository? (y/n, default: ${FLUX_GITHUB_PERSONAL:-y}): " "${FLUX_GITHUB_PERSONAL:-y}" || return 1
+    prompt_flux_component_selection || return 1
+
+    echo ""
+    print_info "A GitHub PAT is used only for this command and is never saved in the config."
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+        FLUX_GITHUB_TOKEN="$GITHUB_TOKEN"
+        print_info "Using GITHUB_TOKEN from the environment."
+    else
+        read -r -s -p "GitHub Personal Access Token: " FLUX_GITHUB_TOKEN || return 1
+        echo ""
+    fi
+    [ -n "${FLUX_GITHUB_TOKEN:-}" ] || { print_error "A GitHub token is required for token-auth bootstrap."; return 1; }
+
+    FLUX_BOOTSTRAP_MODE=github
+}
+
+prompt_flux_install_mode() {
+    flux_load_bootstrap_settings
+    if [ -n "${FLUX_BOOTSTRAP_MODE:-}" ]; then
+        return 0
+    fi
+
+    echo ""
+    print_info "No saved Flux installation mode was found."
+    echo "1. GitHub bootstrap (recommended; Git is the source of truth)"
+    echo "2. Direct cluster installation"
+    read -r -p "Choose installation mode: " flux_mode_choice || return 1
+    case "$flux_mode_choice" in
+        1) FLUX_BOOTSTRAP_MODE=github ;;
+        2) FLUX_BOOTSTRAP_MODE=direct ;;
+        *) print_error "Invalid Flux installation mode."; return 1 ;;
+    esac
+}
+
+flux_build_bootstrap_args() {
+    local components_csv
+    local components_extra_csv
+
+    components_csv=$(flux_join_csv "${FLUX_COMPONENTS[@]}")
+    components_extra_csv=$(flux_join_csv "${FLUX_COMPONENTS_EXTRA[@]}")
+    FLUX_BOOTSTRAP_ARGS=(bootstrap github
+        --owner "$FLUX_GITHUB_OWNER"
+        --repository "$FLUX_GITHUB_REPOSITORY"
+        --branch "$FLUX_GITHUB_BRANCH"
+        --path "$FLUX_GITHUB_PATH"
+        --token-auth
+        --components "$components_csv")
+    [ -n "$components_extra_csv" ] && FLUX_BOOTSTRAP_ARGS+=(--components-extra "$components_extra_csv")
+    [ "$FLUX_GITHUB_PERSONAL" = "y" ] && FLUX_BOOTSTRAP_ARGS+=(--personal)
+    [ -n "${FLUX_TARGET_VERSION:-}" ] && FLUX_BOOTSTRAP_ARGS+=(--version "$FLUX_TARGET_VERSION")
+}
+
+flux_build_install_args() {
+    local components_csv
+    local components_extra_csv
+
+    components_csv=$(flux_join_csv "${FLUX_COMPONENTS[@]}")
+    components_extra_csv=$(flux_join_csv "${FLUX_COMPONENTS_EXTRA[@]}")
+    FLUX_INSTALL_ARGS=(install --components "$components_csv")
+    [ -n "$components_extra_csv" ] && FLUX_INSTALL_ARGS+=(--components-extra "$components_extra_csv")
+    [ -n "${FLUX_TARGET_VERSION:-}" ] && FLUX_INSTALL_ARGS+=(--version "$FLUX_TARGET_VERSION")
+}
+
+flux_print_bootstrap_summary() {
+    echo -e "${YELLOW}======== Flux Configuration Summary ========${NC}"
+    echo "Mode: ${FLUX_BOOTSTRAP_MODE}"
+    if [ "$FLUX_BOOTSTRAP_MODE" = "github" ]; then
+        echo "GitHub: ${FLUX_GITHUB_OWNER}/${FLUX_GITHUB_REPOSITORY}"
+        echo "Branch: ${FLUX_GITHUB_BRANCH}"
+        echo "Cluster path: ${FLUX_GITHUB_PATH}"
+        echo "Personal repository: ${FLUX_GITHUB_PERSONAL}"
+    fi
+    echo "Controllers: $(flux_join_csv "${FLUX_COMPONENTS[@]}")"
+    echo "Extra controllers: $(flux_join_csv "${FLUX_COMPONENTS_EXTRA[@]}")"
+    echo "Target version: ${FLUX_TARGET_VERSION:-latest}"
+    echo -e "${YELLOW}=============================================${NC}"
+}
+
+flux_migrate_cluster_resources() {
+    print_warning "Flux custom resources must be migrated before a minor-version upgrade."
+    print_info "This updates the live Flux resources in Kubernetes; it does not save a Git commit."
+    prompt_yn confirm_flux_migrate "Run 'flux migrate' against the live cluster now? (y/n, default: y): " "y" || return 1
+    [ "$confirm_flux_migrate" = "y" ] || { print_error "Flux upgrade cancelled before migration."; return 1; }
+
+    if ! KUBECONFIG="$K0S_KUBECONFIG" flux migrate; then
+        print_error "Flux resource migration failed. Controllers were not upgraded."
+        return 1
+    fi
+    print_successful "Live Flux resources migrated."
+}
+
+flux_migrate_github_manifests() {
+    local temp_dir
+    local askpass_file
+    local repo_dir
+    local target_minor=""
+    local -a migrate_args
+    local confirm_git_push
+
+    if ! command -v git >/dev/null 2>&1; then
+        print_error "git is required to migrate the Flux manifests in GitHub."
+        return 1
+    fi
+
+    print_info "The live cluster was migrated, but Git must also be updated so Flux does not restore deprecated APIs."
+    prompt_yn migrate_git "Migrate the configured GitHub cluster manifests and push the change? (y/n, default: y): " "y" || return 1
+    [ "$migrate_git" = "y" ] || {
+        print_error "Git manifest migration was declined; Flux upgrade cancelled."
+        return 1
+    }
+
+    temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/flux-migrate.XXXXXX") || {
+        print_error "Could not create a temporary directory for the Git migration."
+        return 1
+    }
+    askpass_file="$temp_dir/git-askpass.sh"
+    repo_dir="$temp_dir/repository"
+
+    printf '%s\n' \
+        '#!/bin/sh' \
+        'case "$1" in' \
+        '  *Username*) printf "%s\\n" "x-access-token" ;;' \
+        '  *) printf "%s\\n" "$FLUX_GITHUB_TOKEN" ;;' \
+        'esac' > "$askpass_file"
+    chmod 0700 "$askpass_file"
+
+    print_info "Cloning ${FLUX_GITHUB_OWNER}/${FLUX_GITHUB_REPOSITORY} temporarily..."
+    if ! GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="$askpass_file" \
+         FLUX_GITHUB_TOKEN="$FLUX_GITHUB_TOKEN" \
+         git clone --depth 1 --branch "$FLUX_GITHUB_BRANCH" \
+         "https://github.com/${FLUX_GITHUB_OWNER}/${FLUX_GITHUB_REPOSITORY}.git" "$repo_dir"; then
+        rm -rf "$temp_dir"
+        print_error "Could not clone the configured Flux GitHub repository."
+        return 1
+    fi
+
+    if [ ! -d "$repo_dir/$FLUX_GITHUB_PATH" ]; then
+        rm -rf "$temp_dir"
+        print_error "Configured Flux path does not exist in the repository: $FLUX_GITHUB_PATH"
+        return 1
+    fi
+
+    migrate_args=(-f "$repo_dir/$FLUX_GITHUB_PATH" --yes)
+    if [ -n "${FLUX_TARGET_VERSION:-}" ]; then
+        target_minor=$(printf '%s' "$FLUX_TARGET_VERSION" | sed -E 's/^v?([0-9]+\.[0-9]+).*/\1/')
+        if [[ "$target_minor" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            migrate_args+=(--version "$target_minor")
+        fi
+    fi
+
+    print_info "Migrating Flux manifests under $FLUX_GITHUB_PATH..."
+    if ! flux migrate "${migrate_args[@]}"; then
+        rm -rf "$temp_dir"
+        print_error "Flux Git manifest migration failed."
+        return 1
+    fi
+
+    if git -C "$repo_dir" diff --quiet -- "$FLUX_GITHUB_PATH"; then
+        print_successful "No Git manifest changes were required."
+        rm -rf "$temp_dir"
+        return 0
+    fi
+
+    echo ""
+    print_info "Flux manifest changes to be committed:"
+    git -C "$repo_dir" diff --stat -- "$FLUX_GITHUB_PATH"
+    prompt_yn confirm_git_push "Commit and push these Flux manifest changes? (y/n, default: n): " "n" || {
+        rm -rf "$temp_dir"
+        return 1
+    }
+    if [ "$confirm_git_push" != "y" ]; then
+        rm -rf "$temp_dir"
+        print_error "Git manifest changes were not pushed; Flux upgrade cancelled."
+        return 1
+    fi
+
+    if ! git -C "$repo_dir" add -- "$FLUX_GITHUB_PATH" || \
+       ! git -C "$repo_dir" -c user.name="Flux Migration" \
+           -c user.email="flux-migration@localhost" \
+           commit -m "Migrate Flux resources for ${FLUX_TARGET_VERSION:-latest}" || \
+       ! GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="$askpass_file" \
+           FLUX_GITHUB_TOKEN="$FLUX_GITHUB_TOKEN" \
+           git -C "$repo_dir" push origin "$FLUX_GITHUB_BRANCH"; then
+        rm -rf "$temp_dir"
+        print_error "Could not commit and push the migrated Flux manifests."
+        return 1
+    fi
+
+    rm -rf "$temp_dir"
+    print_successful "Flux Git manifests migrated and pushed."
+}
+
+flux_verify_installation() {
+    print_info "Checking Flux controllers after the operation..."
+    if ! KUBECONFIG="$K0S_KUBECONFIG" flux check; then
+        print_error "Flux verification failed."
+        KUBECONFIG="$K0S_KUBECONFIG" kubectl get pods -n flux-system 2>/dev/null || true
+        return 1
+    fi
+
+    if [ "$FLUX_BOOTSTRAP_MODE" = "github" ] && \
+       KUBECONFIG="$K0S_KUBECONFIG" kubectl get kustomization.kustomize.toolkit.fluxcd.io flux-system -n flux-system &>/dev/null; then
+        print_info "Reconciling flux-system..."
+        if ! KUBECONFIG="$K0S_KUBECONFIG" flux reconcile ks flux-system --with-source; then
+            print_error "flux-system reconciliation failed."
+            return 1
+        fi
+    fi
+
+    KUBECONFIG="$K0S_KUBECONFIG" kubectl get deployments -n flux-system 2>/dev/null || true
+    print_successful "FluxCD operation verified."
+}
+
+setup_fluxcd() {
+    while true; do
+        echo -e "${YELLOW}======== FluxCD Setup ========${NC}"
+        echo "1. New / Reconfigure GitHub Bootstrap"
+        echo "2. Upgrade Existing FluxCD"
+        echo "3. Show Saved Bootstrap Settings"
+        echo "4. Back to FluxCD Menu"
+        echo -e "${YELLOW}===============================${NC}"
+        read -r -p "Enter your choice: " setup_choice || return
+
+        case "$setup_choice" in
+            1) bootstrap_fluxcd ;;
+            2) upgrade_fluxcd ;;
+            3) show_flux_bootstrap_settings ;;
+            4) return ;;
+            *) print_error "Invalid option." ;;
+        esac
+    done
 }
 
 bootstrap_fluxcd() {
-    print_info "Bootstrapping FluxCD with GitHub..."
+    print_info "Interactive FluxCD GitHub bootstrap..."
+    ensure_config || return 1
+    flux_load_bootstrap_settings
+    prompt_flux_github_settings || return 1
+    flux_print_bootstrap_summary
+    prompt_yn confirm_flux_bootstrap "Apply these Flux settings and update GitHub? (y/n, default: n): " "n" || return 1
+    [ "$confirm_flux_bootstrap" = "y" ] || { print_info "Flux bootstrap cancelled."; return 0; }
 
-    if ! command -v flux &> /dev/null; then
-        print_info "Flux CLI not found. Downloading and installing..."
-        curl -s https://fluxcd.io/install.sh | sudo bash
+    flux_save_bootstrap_settings
+    install_or_update_flux_cli || return 1
+
+    if ! KUBECONFIG="$K0S_KUBECONFIG" flux check --pre; then
+        print_error "Flux preflight check failed. Bootstrap was not started."
+        return 1
     fi
 
-    read -p "Enter your GitHub owner (user/org): " GITHUB_OWNER
-    read -p "Enter your GitHub repository: " GITHUB_REPO
-    read -p "Enter branch to use (default: main): " GITHUB_BRANCH
-    GITHUB_BRANCH=${GITHUB_BRANCH:-main}
-    read -p "Enter path in repo for cluster config (default: cluster): " GITHUB_PATH
-    GITHUB_PATH=${GITHUB_PATH:-cluster}
-    read -p "Is this a personal repo? (y/n, default: y): " PERSONAL
-    PERSONAL=${PERSONAL:-y}
+    flux_build_bootstrap_args
+    print_info "Running GitHub bootstrap with the selected controllers..."
+    if ! GITHUB_TOKEN="$FLUX_GITHUB_TOKEN" KUBECONFIG="$K0S_KUBECONFIG" flux "${FLUX_BOOTSTRAP_ARGS[@]}"; then
+        print_error "Flux GitHub bootstrap failed."
+        return 1
+    fi
 
-    echo ""
-    print_info "To authenticate, you need a GitHub Personal Access Token (PAT) with 'repo' and 'workflow' scopes."
-    print_info "How to create a PAT:"
-    echo "  1. Go to https://github.com/settings/tokens"
-    echo "  2. Click 'Generate new token' (classic)"
-    echo "  3. Set a name, expiration, and select 'repo' and 'workflow' scopes"
-    echo "  4. Generate the token and copy it (you will not see it again!)"
-    echo ""
+    flux_verify_installation
+}
 
-    read -p "Enter your GitHub Personal Access Token: " GITHUB_TOKEN
-    echo
+upgrade_fluxcd() {
+    print_info "Interactive FluxCD upgrade..."
+    ensure_config || return 1
+    flux_load_bootstrap_settings
+    prompt_flux_install_mode || return 1
 
-    CMD="flux bootstrap github --owner=$GITHUB_OWNER --repository=$GITHUB_REPO --branch=$GITHUB_BRANCH --path=$GITHUB_PATH --token-auth --components=source-controller,kustomize-controller,notification-controller --components-extra=image-reflector-controller,image-automation-controller"
-    [ "$PERSONAL" = "y" ] && CMD="$CMD --personal"
+    read -r -p "Target FluxCD version (leave empty for latest): " FLUX_TARGET_VERSION || return 1
+    FLUX_TARGET_VERSION=$(trim_value "$FLUX_TARGET_VERSION")
 
-    export GITHUB_TOKEN="$GITHUB_TOKEN"
-    export KUBECONFIG="$K0S_KUBECONFIG"
+    if [ "$FLUX_BOOTSTRAP_MODE" = "github" ]; then
+        prompt_flux_github_settings || return 1
+    else
+        prompt_flux_component_selection || return 1
+    fi
 
-    eval "$CMD"
+    flux_print_bootstrap_summary
+    prompt_yn confirm_flux_upgrade "Continue with this FluxCD upgrade? (y/n, default: n): " "n" || return 1
+    [ "$confirm_flux_upgrade" = "y" ] || { print_info "FluxCD upgrade cancelled."; return 0; }
 
-    print_successful "FluxCD bootstrap process completed."
+    flux_save_bootstrap_settings
+    install_or_update_flux_cli || return 1
+
+    if ! KUBECONFIG="$K0S_KUBECONFIG" flux check --pre; then
+        print_error "Flux preflight check failed. Upgrade was not started."
+        return 1
+    fi
+
+    flux_migrate_cluster_resources || return 1
+
+    if [ "$FLUX_BOOTSTRAP_MODE" = "github" ]; then
+        flux_migrate_github_manifests || return 1
+    fi
+
+    if [ "$FLUX_BOOTSTRAP_MODE" = "github" ]; then
+        flux_build_bootstrap_args
+        print_info "Re-running the saved GitHub bootstrap configuration..."
+        if ! GITHUB_TOKEN="$FLUX_GITHUB_TOKEN" KUBECONFIG="$K0S_KUBECONFIG" flux "${FLUX_BOOTSTRAP_ARGS[@]}"; then
+            print_error "Flux GitHub bootstrap upgrade failed."
+            return 1
+        fi
+    else
+        flux_build_install_args
+        print_info "Upgrading the direct Flux installation..."
+        if ! KUBECONFIG="$K0S_KUBECONFIG" flux "${FLUX_INSTALL_ARGS[@]}"; then
+            print_error "Direct Flux installation upgrade failed."
+            return 1
+        fi
+    fi
+
+    flux_verify_installation
 }
 
 manage_cilium() {
@@ -4046,25 +4551,25 @@ manage_cilium() {
 }
 
 manage_flux() {
-    echo -e "${YELLOW}======== FluxCD Management ========${NC}"
-    echo "1. Bootstrap FluxCD with GitHub"
-    echo "2. Check FluxCD Status"
-    echo "3. Add FluxCD Controller"
-    echo "4. Remove FluxCD Controller"
-    echo "5. Upgrade FluxCD"
-    echo "6. Back to Main Menu"
-    echo -e "${YELLOW}===================================${NC}"
-    read -p "Enter your choice: " flux_choice
+    while true; do
+        echo -e "${YELLOW}======== FluxCD Management ========${NC}"
+        echo "1. Setup / Bootstrap / Upgrade FluxCD"
+        echo "2. Check FluxCD Status"
+        echo "3. Add FluxCD Controller"
+        echo "4. Remove FluxCD Controller"
+        echo "5. Back to Main Menu"
+        echo -e "${YELLOW}===================================${NC}"
+        read -r -p "Enter your choice: " flux_choice || return
 
-    case $flux_choice in
-        1) bootstrap_fluxcd ;;
-        2) check_fluxcd_status ;;
-        3) add_fluxcd_controller ;;
-        4) remove_fluxcd_controller ;;
-        5) upgrade_fluxcd ;;
-        6) return ;;
-        *) print_error "Invalid option. Returning to main menu." ;;
-    esac
+        case $flux_choice in
+            1) setup_fluxcd ;;
+            2) check_fluxcd_status ;;
+            3) add_fluxcd_controller ;;
+            4) remove_fluxcd_controller ;;
+            5) return ;;
+            *) print_error "Invalid option." ;;
+        esac
+    done
 }
 
 # -----------------------------------------------------------------------------
