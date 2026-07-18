@@ -47,12 +47,16 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
+<<<<<<< HEAD
 SCRIPT_VERSION="1.0.78"
 
 # Flux bootstrap defaults. These are saved to the cluster config after the
 # first interactive bootstrap so upgrades can reuse the exact same component set.
 FLUX_DEFAULT_COMPONENTS=(source-controller kustomize-controller helm-controller notification-controller)
 FLUX_DEFAULT_COMPONENTS_EXTRA=(image-reflector-controller image-automation-controller)
+=======
+SCRIPT_VERSION="1.0.77"
+>>>>>>> 88b59aa5f824f1bee4b7070f627fa6f769a4c654
 
 printf -v LONGHORN_MULTIPATH_BOOT_BLOCK '%s\n' \
 '    - name: "Disable multipathd for Longhorn"' \
@@ -70,6 +74,32 @@ printf -v LONGHORN_DM_CRYPT_BOOT_BLOCK '%s\n' \
 '          printf "%s\\n" dm_crypt > /etc/modules-load.d/longhorn.conf' \
 '          if ! modprobe dm_crypt; then' \
 '            echo "Longhorn requires the dm_crypt kernel module; it is missing from $(uname -r)." >&2' \
+'            exit 1' \
+'          fi'
+
+printf -v LONGHORN_V2_BOOT_BLOCK '%s\n' \
+'    - name: "Prepare Longhorn V2 Data Engine"' \
+'      commands:' \
+'        - |' \
+'          set -eu' \
+'          mkdir -p /etc/modules-load.d' \
+'          printf "%s\\n" vfio_pci uio_pci_generic nvme_tcp > /etc/modules-load.d/longhorn-v2.conf' \
+'          for module in vfio_pci uio_pci_generic nvme_tcp; do' \
+'            if ! modprobe "$module"; then' \
+'              echo "Longhorn V2 requires the $module kernel module; it is missing from $(uname -r)." >&2' \
+'              exit 1' \
+'            fi' \
+'          done' \
+'          hugepages=/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages' \
+'          if [ ! -w "$hugepages" ]; then' \
+'            echo "Longhorn V2 requires writable 2 MiB HugePages on $(uname -r)." >&2' \
+'            exit 1' \
+'          fi' \
+'          if [ "$(cat "$hugepages")" -lt 1024 ]; then' \
+'            echo 1024 > "$hugepages"' \
+'          fi' \
+'          if [ "$(cat "$hugepages")" -lt 1024 ]; then' \
+'            echo "Longhorn V2 requires at least 2 GiB of 2 MiB HugePages." >&2' \
 '            exit 1' \
 '          fi'
 
@@ -670,7 +700,7 @@ generate_controller_cloudconfig() {
     local INSTALL_BLOCK=""
     local LONGHORN_BOOT_BLOCK=""
     if [ "${CONTROLLER_WORKER:-n}" = "y" ]; then
-        LONGHORN_BOOT_BLOCK="${LONGHORN_MULTIPATH_BOOT_BLOCK}${LONGHORN_DM_CRYPT_BOOT_BLOCK}"
+        LONGHORN_BOOT_BLOCK="${LONGHORN_MULTIPATH_BOOT_BLOCK}${LONGHORN_DM_CRYPT_BOOT_BLOCK}${LONGHORN_V2_BOOT_BLOCK}"
     fi
     read -p "Enable auto-install (zero-touch, formats /dev/sda and reboots)? (y/n, default: n): " AUTO_INSTALL
     if [ "${AUTO_INSTALL:-n}" = "y" ]; then
@@ -1125,6 +1155,7 @@ stages:
         - ${SAFE_SCRIPT_UPDATE_COMMAND}
 ${LONGHORN_MULTIPATH_BOOT_BLOCK}
 ${LONGHORN_DM_CRYPT_BOOT_BLOCK}
+${LONGHORN_V2_BOOT_BLOCK}
   boot.after:
     - name: "Enable iSCSI"
       commands:
@@ -1290,7 +1321,7 @@ generate_controller_join_cloudconfig() {
     extra_cmdline: \"rd.neednet=1\""
     local LONGHORN_BOOT_BLOCK=""
     if [ "${CONTROLLER_WORKER:-n}" = "y" ]; then
-        LONGHORN_BOOT_BLOCK="${LONGHORN_MULTIPATH_BOOT_BLOCK}${LONGHORN_DM_CRYPT_BOOT_BLOCK}"
+        LONGHORN_BOOT_BLOCK="${LONGHORN_MULTIPATH_BOOT_BLOCK}${LONGHORN_DM_CRYPT_BOOT_BLOCK}${LONGHORN_V2_BOOT_BLOCK}"
     fi
 
     # Use the same dedicated management key on every controller.
