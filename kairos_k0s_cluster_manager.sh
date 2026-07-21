@@ -47,7 +47,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.85"
+SCRIPT_VERSION="1.0.88"
 
 # Flux bootstrap defaults. These are saved to the cluster config after the
 # first interactive bootstrap so upgrades can reuse the exact same component set.
@@ -5181,6 +5181,7 @@ longhorn_wait_for_restore_detached() {
     local volume_name="$1"
     local timeout_seconds="${2:-1800}"
     local deadline=$((SECONDS + timeout_seconds))
+    local missing_attempts=0
 
     print_info "Waiting for restored volume ${volume_name} to finish..."
     while [ "$SECONDS" -lt "$deadline" ]; do
@@ -5198,14 +5199,21 @@ longhorn_wait_for_restore_detached() {
             "$(longhorn_display_value "$robustness")" \
             "$(longhorn_display_value "$restore_required")"
 
+        if [ -z "$restore_required" ] && [ -z "$state" ]; then
+            missing_attempts=$((missing_attempts + 1))
+            if [ "$missing_attempts" -ge 12 ]; then
+                print_error "Restored Longhorn volume ${volume_name} could not be read after waiting for it to appear."
+                return 1
+            fi
+            print_info "Waiting for restored Longhorn volume ${volume_name} to appear..."
+            sleep 5
+            continue
+        fi
+        missing_attempts=0
+
         if [ "$restore_required" = "false" ] && [ "$state" = "detached" ]; then
             print_successful "Restore completed and volume is detached."
             return 0
-        fi
-
-        if [ -z "$restore_required" ] && [ -z "$state" ]; then
-            print_error "Restored Longhorn volume ${volume_name} could not be read."
-            return 1
         fi
         sleep 10
     done
@@ -5228,6 +5236,11 @@ longhorn_suspend_flux_resource() {
 
     suspended=$(longhorn_kubectl get "$kind" "$name" -n "$namespace" -o jsonpath='{.spec.suspend}' 2>/dev/null)
     if [ "$suspended" = "true" ]; then
+        if [ "${LONGHORN_RESTORE_RESUME_SUSPENDED:-n}" = "y" ]; then
+            LONGHORN_FLUX_CHANGED_KINDS+=("$kind")
+            LONGHORN_FLUX_CHANGED_NAMES+=("$name")
+            LONGHORN_FLUX_CHANGED_NAMESPACES+=("$namespace")
+        fi
         print_successful "Flux ${kind} ${namespace}/${name} is already suspended."
         return 0
     fi
@@ -5538,17 +5551,61 @@ longhorn_validate_existing_pv_pvc_binding() {
 }
 
 longhorn_restore_volume_name() {
-    local namespace="$1"
-    local pvc_name="$2"
-    local backup_name="$3"
-    local restore_name
+    local source_volume="$1"
 
-    restore_name=$(sanitize_k8s_name "restore-${namespace}-${pvc_name}-${backup_name}")
-    if [ "${#restore_name}" -gt 63 ]; then
-        restore_name="${restore_name:0:63}"
-        restore_name="${restore_name%-}"
+    if [ -z "$source_volume" ] || [ "${#source_volume}" -gt 63 ] || \
+        ! [[ "$source_volume" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
+        print_error "Original Longhorn volume name is not a valid Kubernetes name: ${source_volume:-<empty>}"
+        return 1
     fi
-    printf '%s' "$restore_name"
+
+    printf '%s' "$source_volume"
+}
+
+longhorn_find_restore_volume_handle() {
+    local backup_url="$1"
+    local backup_size="$2"
+    local preferred_name="${3:-}"
+    local name from_backup size created_at selected_name selected_created_at
+
+    while IFS=$'\t' read -r name from_backup size created_at; do
+        [ "$from_backup" = "$backup_url" ] || continue
+        [ "$size" = "$backup_size" ] || continue
+
+        if [ "$name" = "$preferred_name" ]; then
+            printf '%s' "$name"
+            return 0
+        fi
+        if [ -z "$selected_name" ] || [[ "$created_at" > "$selected_created_at" ]]; then
+            selected_name="$name"
+            selected_created_at="$created_at"
+        fi
+    done < <(longhorn_kubectl get volumes.longhorn.io -n longhorn-system \
+        -o 'go-template={{range .items}}{{.metadata.name}}{{"\t"}}{{.spec.fromBackup}}{{"\t"}}{{.spec.size}}{{"\t"}}{{.metadata.creationTimestamp}}{{"\n"}}{{end}}' \
+        2>/dev/null)
+
+    [ -n "$selected_name" ] || return 1
+    printf '%s' "$selected_name"
+}
+
+longhorn_resolve_restore_volume_handle() {
+    local backup_url="$1"
+    local backup_size="$2"
+    local preferred_name="$3"
+    local timeout_seconds="${4:-120}"
+    local deadline=$((SECONDS + timeout_seconds))
+    local resolved_name
+
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        resolved_name=$(longhorn_find_restore_volume_handle "$backup_url" "$backup_size" "$preferred_name")
+        if [ -n "$resolved_name" ]; then
+            printf '%s' "$resolved_name"
+            return 0
+        fi
+        sleep 5
+    done
+
+    return 1
 }
 
 longhorn_wait_for_pvc_binding() {
@@ -5607,12 +5664,20 @@ EOF
             -o jsonpath='{.spec.fromBackup}' 2>/dev/null)
         existing_size=$(longhorn_kubectl get volume "$restore_handle" -n longhorn-system \
             -o jsonpath='{.spec.size}' 2>/dev/null)
-        if [ "$existing_url" != "$url" ] || [ "$existing_size" != "$size" ]; then
-            print_error "Restore volume ${restore_handle} already exists with different backup or size."
-            print_info "Manifest: $manifest"
-            return 1
+        if [ "$existing_url" = "$url" ] && [ "$existing_size" = "$size" ]; then
+            print_info "Reusing existing original-name volume ${restore_handle} for ${namespace}/${pvc}."
+            return 0
         fi
-        print_info "Reusing existing restore volume ${restore_handle} for ${namespace}/${pvc}."
+        print_error "Original Longhorn volume name ${restore_handle} is already occupied by a different volume."
+        print_info "Refusing to overwrite it. Manifest: $manifest"
+        return 1
+    fi
+
+    local existing_restore_handle
+    existing_restore_handle=$(longhorn_find_restore_volume_handle "$url" "$size" "$restore_handle")
+    if [ -n "$existing_restore_handle" ]; then
+        LONGHORN_BATCH_RESTORE_HANDLES[$index]="$existing_restore_handle"
+        print_info "Reusing existing restore volume ${existing_restore_handle} for ${namespace}/${pvc}."
         return 0
     fi
 
@@ -5621,6 +5686,17 @@ EOF
         print_error "Could not create restore volume ${restore_handle} for ${namespace}/${pvc}."
         print_info "Manifest: $manifest"
         return 1
+    fi
+
+    local resolved_restore_handle
+    resolved_restore_handle=$(longhorn_resolve_restore_volume_handle "$url" "$size" "$restore_handle" 120) || {
+        print_error "Restore Volume for ${namespace}/${pvc} was not discoverable after creation."
+        print_info "Manifest: $manifest"
+        return 1
+    }
+    LONGHORN_BATCH_RESTORE_HANDLES[$index]="$resolved_restore_handle"
+    if [ "$resolved_restore_handle" != "$restore_handle" ]; then
+        print_info "Longhorn created restore volume ${resolved_restore_handle}; using that actual CR name for the PV volumeHandle."
     fi
 }
 
@@ -5774,12 +5850,12 @@ ${access_modes_yaml}
     fsType: ${fs_type}
     volumeAttributes:
       backupTargetName: "${backup_target}"
-    dataLocality: "${data_locality}"
+      dataLocality: "${data_locality}"
       dataEngine: "${engine}"
-    disableRevisionCounter: "${disable_revision_counter}"
+      disableRevisionCounter: "${disable_revision_counter}"
       numberOfReplicas: "${replicas}"
-    staleReplicaTimeout: "${stale_replica_timeout}"
-    unmapMarkSnapChainRemoved: "${unmap_mark_snap_chain_removed}"
+      staleReplicaTimeout: "${stale_replica_timeout}"
+      unmapMarkSnapChainRemoved: "${unmap_mark_snap_chain_removed}"
     volumeHandle: ${restore_handle}
 ---
 apiVersion: v1
@@ -5902,7 +5978,8 @@ longhorn_restore_application_pvcs_impl() {
     local data_locality disable_revision_counter unmap_mark_snap_chain_removed stale_replica_timeout
     local source_volume latest_backup last_backup_at source_size access_mode
     local backup_match_count backup_matches=() backup_match
-    local plan_pv plan_source plan_backup plan_backup_at plan_size plan_status
+    local plan_pv plan_source plan_backup plan_backup_at plan_size plan_status restore_handle
+    local existing_target_url existing_target_size
 
     for pvc in "${target_pvcs[@]}"; do
         plan_pv="-"
@@ -6037,28 +6114,47 @@ longhorn_restore_application_pvcs_impl() {
                 plan_status="BACKUP SIZE MISMATCH"
                 preflight_failed=y
             else
-                LONGHORN_BATCH_PVCS+=("$pvc")
-                LONGHORN_BATCH_PVS+=("$pv")
-                LONGHORN_BATCH_HANDLES+=("$handle")
-                LONGHORN_BATCH_BACKUPS+=("$LONGHORN_SELECTED_BACKUP")
-                LONGHORN_BATCH_SOURCES+=("$source_volume")
-                LONGHORN_BATCH_URLS+=("$LONGHORN_SELECTED_BACKUP_URL")
-                LONGHORN_BATCH_SIZES+=("$LONGHORN_SELECTED_BACKUP_SIZE")
-                LONGHORN_BATCH_REPLICAS+=("$current_replicas")
-                LONGHORN_BATCH_ENGINES+=("$current_engine")
-                LONGHORN_BATCH_ACCESS_MODES+=("${access_mode:-rwo}")
-                LONGHORN_BATCH_RESTORE_HANDLES+=("$(longhorn_restore_volume_name "$namespace" "$pvc" "$LONGHORN_SELECTED_BACKUP")")
-                LONGHORN_BATCH_STORAGE_CLASSES+=("$storage_class")
-                LONGHORN_BATCH_PV_CAPACITIES+=("$pv_capacity")
-                LONGHORN_BATCH_REQUESTED_SIZES+=("$requested_size")
-                LONGHORN_BATCH_VOLUME_MODES+=("$volume_mode")
-                LONGHORN_BATCH_PV_ACCESS_MODES+=("$pv_access_modes")
-                LONGHORN_BATCH_FS_TYPES+=("$fs_type")
-                LONGHORN_BATCH_BACKUP_TARGETS+=("$backup_target")
-                LONGHORN_BATCH_DATA_LOCALITIES+=("$data_locality")
-                LONGHORN_BATCH_DISABLE_REVISION_COUNTERS+=("$disable_revision_counter")
-                LONGHORN_BATCH_UNMAP_MARK_SNAP_CHAIN_REMOVED+=("$unmap_mark_snap_chain_removed")
-                LONGHORN_BATCH_STALE_REPLICA_TIMEOUTS+=("$stale_replica_timeout")
+                if ! restore_handle=$(longhorn_restore_volume_name "$source_volume"); then
+                    plan_status="INVALID SOURCE VOLUME NAME"
+                    preflight_failed=y
+                else
+                    if longhorn_kubectl get volume "$restore_handle" -n longhorn-system &>/dev/null; then
+                        existing_target_url=$(longhorn_kubectl get volume "$restore_handle" -n longhorn-system \
+                            -o jsonpath='{.spec.fromBackup}' 2>/dev/null)
+                        existing_target_size=$(longhorn_kubectl get volume "$restore_handle" -n longhorn-system \
+                            -o jsonpath='{.spec.size}' 2>/dev/null)
+                        if [ "$existing_target_url" != "$LONGHORN_SELECTED_BACKUP_URL" ] || \
+                            [ "$existing_target_size" != "$LONGHORN_SELECTED_BACKUP_SIZE" ]; then
+                            plan_status="ORIGINAL VOLUME NAME OCCUPIED"
+                            preflight_failed=y
+                        fi
+                    fi
+
+                    if [ "$plan_status" = "READY" ]; then
+                        LONGHORN_BATCH_PVCS+=("$pvc")
+                        LONGHORN_BATCH_PVS+=("$pv")
+                        LONGHORN_BATCH_HANDLES+=("$handle")
+                        LONGHORN_BATCH_BACKUPS+=("$LONGHORN_SELECTED_BACKUP")
+                        LONGHORN_BATCH_SOURCES+=("$source_volume")
+                        LONGHORN_BATCH_URLS+=("$LONGHORN_SELECTED_BACKUP_URL")
+                        LONGHORN_BATCH_SIZES+=("$LONGHORN_SELECTED_BACKUP_SIZE")
+                        LONGHORN_BATCH_REPLICAS+=("$current_replicas")
+                        LONGHORN_BATCH_ENGINES+=("$current_engine")
+                        LONGHORN_BATCH_ACCESS_MODES+=("${access_mode:-rwo}")
+                        LONGHORN_BATCH_RESTORE_HANDLES+=("$restore_handle")
+                        LONGHORN_BATCH_STORAGE_CLASSES+=("$storage_class")
+                        LONGHORN_BATCH_PV_CAPACITIES+=("$pv_capacity")
+                        LONGHORN_BATCH_REQUESTED_SIZES+=("$requested_size")
+                        LONGHORN_BATCH_VOLUME_MODES+=("$volume_mode")
+                        LONGHORN_BATCH_PV_ACCESS_MODES+=("$pv_access_modes")
+                        LONGHORN_BATCH_FS_TYPES+=("$fs_type")
+                        LONGHORN_BATCH_BACKUP_TARGETS+=("$backup_target")
+                        LONGHORN_BATCH_DATA_LOCALITIES+=("$data_locality")
+                        LONGHORN_BATCH_DISABLE_REVISION_COUNTERS+=("$disable_revision_counter")
+                        LONGHORN_BATCH_UNMAP_MARK_SNAP_CHAIN_REMOVED+=("$unmap_mark_snap_chain_removed")
+                        LONGHORN_BATCH_STALE_REPLICA_TIMEOUTS+=("$stale_replica_timeout")
+                    fi
+                fi
             fi
         fi
 
@@ -6160,6 +6256,7 @@ longhorn_restore_application_pvcs() {
     LONGHORN_RESTORE_TARGET_PVC=""
     LONGHORN_RESTORE_WORKLOADS_SCALED=n
     LONGHORN_RESTORE_OPERATION_STARTED=n
+    LONGHORN_RESTORE_RESUME_SUSPENDED=y
 
     longhorn_restore_application_pvcs_impl
     local restore_result=$?
@@ -6414,8 +6511,8 @@ longhorn_restore_into_existing_pvc_impl() {
         return 1
     fi
 
-        local restore_handle
-        restore_handle=$(longhorn_restore_volume_name "$target_namespace" "$target_pvc" "$selected_backup")
+    local restore_handle
+    restore_handle=$(longhorn_restore_volume_name "$selected_source") || return 1
         print_warning "The selected backup will be restored into a new Longhorn volume ${restore_handle}."
         print_warning "The existing PVC will then be rebound to that restored volume."
     echo "  Existing PV:    $pv_name"
@@ -6474,6 +6571,7 @@ longhorn_restore_into_existing_pvc() {
     LONGHORN_RESTORE_TARGET_PVC=""
     LONGHORN_RESTORE_WORKLOADS_SCALED=n
     LONGHORN_RESTORE_OPERATION_STARTED=n
+    LONGHORN_RESTORE_RESUME_SUSPENDED=y
 
     longhorn_restore_into_existing_pvc_impl
     local restore_result=$?
