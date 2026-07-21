@@ -47,7 +47,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.82"
+SCRIPT_VERSION="1.0.84"
 
 # Flux bootstrap defaults. These are saved to the cluster config after the
 # first interactive bootstrap so upgrades can reuse the exact same component set.
@@ -5451,6 +5451,61 @@ longhorn_select_backup_source_for_pvc() {
         LONGHORN_SELECTED_SOURCE_ACCESS_MODE <<< "$selected"
 }
 
+longhorn_set_pv_reclaim_policy() {
+    local pv_name="$1"
+    local reclaim_policy="$2"
+    local current_policy
+
+    current_policy=$(longhorn_kubectl get pv "$pv_name" \
+        -o jsonpath='{.spec.persistentVolumeReclaimPolicy}' 2>/dev/null)
+    if [ "$current_policy" = "$reclaim_policy" ]; then
+        return 0
+    fi
+
+    print_info "Setting PV ${pv_name} reclaim policy to ${reclaim_policy}..."
+    if ! longhorn_kubectl patch pv "$pv_name" --type merge \
+        -p "{\"spec\":{\"persistentVolumeReclaimPolicy\":\"${reclaim_policy}\"}}"; then
+        print_error "Could not set PV ${pv_name} reclaim policy to ${reclaim_policy}."
+        return 1
+    fi
+
+    current_policy=$(longhorn_kubectl get pv "$pv_name" \
+        -o jsonpath='{.spec.persistentVolumeReclaimPolicy}' 2>/dev/null)
+    if [ "$current_policy" != "$reclaim_policy" ]; then
+        print_error "PV ${pv_name} reclaim policy is ${current_policy:-unknown}, expected ${reclaim_policy}."
+        return 1
+    fi
+}
+
+longhorn_validate_existing_pv_pvc_binding() {
+    local namespace="$1"
+    local pvc_name="$2"
+    local pv_name="$3"
+    local volume_handle="$4"
+    local pv_phase pvc_phase bound_handle bound_pv claim_namespace claim_name
+
+    if ! longhorn_kubectl get pv "$pv_name" &>/dev/null || \
+        ! longhorn_kubectl get pvc "$pvc_name" -n "$namespace" &>/dev/null; then
+        return 1
+    fi
+
+    pv_phase=$(longhorn_kubectl get pv "$pv_name" -o jsonpath='{.status.phase}' 2>/dev/null)
+    pvc_phase=$(longhorn_kubectl get pvc "$pvc_name" -n "$namespace" \
+        -o jsonpath='{.status.phase}' 2>/dev/null)
+    bound_pv=$(longhorn_kubectl get pvc "$pvc_name" -n "$namespace" \
+        -o jsonpath='{.spec.volumeName}' 2>/dev/null)
+    bound_handle=$(longhorn_kubectl get pv "$pv_name" \
+        -o jsonpath='{.spec.csi.volumeHandle}' 2>/dev/null)
+    claim_namespace=$(longhorn_kubectl get pv "$pv_name" \
+        -o jsonpath='{.spec.claimRef.namespace}' 2>/dev/null)
+    claim_name=$(longhorn_kubectl get pv "$pv_name" \
+        -o jsonpath='{.spec.claimRef.name}' 2>/dev/null)
+
+    [ "$pv_phase" = "Bound" ] && [ "$pvc_phase" = "Bound" ] && \
+        [ "$bound_pv" = "$pv_name" ] && [ "$bound_handle" = "$volume_handle" ] && \
+        [ "$claim_namespace" = "$namespace" ] && [ "$claim_name" = "$pvc_name" ]
+}
+
 longhorn_restore_batch_volume() {
     local index="$1"
     local namespace="$LONGHORN_RESTORE_WORKLOAD_NAMESPACE"
@@ -5464,6 +5519,11 @@ longhorn_restore_batch_volume() {
     local engine="${LONGHORN_BATCH_ENGINES[$index]}"
     local access="${LONGHORN_BATCH_ACCESS_MODES[$index]}"
     local prefix state_file manifest restored_handle restored_phase
+    local original_reclaim_policy
+
+    original_reclaim_policy=$(longhorn_kubectl get pv "$pv" \
+        -o jsonpath='{.spec.persistentVolumeReclaimPolicy}' 2>/dev/null)
+    original_reclaim_policy=${original_reclaim_policy:-Delete}
 
     prefix=$(sanitize_k8s_name "$namespace-$pvc-$backup")
     state_file="./longhorn-existing-restore-$prefix.state"
@@ -5481,6 +5541,7 @@ longhorn_restore_batch_volume() {
         echo "replicas=$replicas"
         echo "data_engine=$engine"
         echo "access_mode=$access"
+        echo "original_reclaim_policy=$original_reclaim_policy"
     } > "$state_file"
     longhorn_kubectl get pvc "$pvc" -n "$namespace" -o yaml >> "$state_file" 2>/dev/null || true
     longhorn_kubectl get pv "$pv" -o yaml >> "$state_file" 2>/dev/null || true
@@ -5501,22 +5562,44 @@ spec:
 EOF
 
     print_info "Restoring $namespace/$pvc from $backup..."
-    longhorn_kubectl delete volume "$handle" -n longhorn-system --wait=true --timeout=180s || return 1
-    if longhorn_kubectl get volume "$handle" -n longhorn-system &>/dev/null; then
-        print_error "The old Longhorn volume still exists: $handle"
-        return 1
-    fi
-    if ! longhorn_kubectl get pv "$pv" &>/dev/null || ! longhorn_kubectl get pvc "$pvc" -n "$namespace" &>/dev/null; then
-        print_error "The PV/PVC binding did not remain available for $namespace/$pvc."
+    if ! longhorn_set_pv_reclaim_policy "$pv" Retain; then
+        print_error "Restore stopped before deleting volume ${handle}; PV/PVC binding was preserved."
         print_info "State record: $state_file"
         return 1
     fi
-    longhorn_kubectl apply -f "$manifest" || return 1
+    if ! longhorn_kubectl delete volume "$handle" -n longhorn-system --wait=true --timeout=180s; then
+        print_error "Could not delete the existing Longhorn volume ${handle}."
+        print_warning "PV ${pv} was left with reclaim policy Retain for manual recovery."
+        return 1
+    fi
+    if longhorn_kubectl get volume "$handle" -n longhorn-system &>/dev/null; then
+        print_error "The old Longhorn volume still exists: $handle"
+        print_warning "PV ${pv} was left with reclaim policy Retain for manual recovery."
+        return 1
+    fi
+    if ! longhorn_validate_existing_pv_pvc_binding "$namespace" "$pvc" "$pv" "$handle"; then
+        print_error "The PV/PVC binding did not remain Bound for $namespace/$pvc after deleting the old volume."
+        print_warning "PV ${pv} was left with reclaim policy Retain for manual recovery."
+        print_info "State record: $state_file"
+        return 1
+    fi
+    if ! longhorn_kubectl apply -f "$manifest"; then
+        print_error "Could not apply the restore manifest for ${namespace}/${pvc}."
+        print_warning "PV ${pv} was left with reclaim policy Retain for manual recovery."
+        return 1
+    fi
     longhorn_wait_for_restore_detached "$handle" 1800 || return 1
     restored_handle=$(longhorn_kubectl get pv "$pv" -o jsonpath='{.spec.csi.volumeHandle}' 2>/dev/null)
     restored_phase=$(longhorn_kubectl get pvc "$pvc" -n "$namespace" -o jsonpath='{.status.phase}' 2>/dev/null)
-    if [ "$restored_handle" != "$handle" ] || [ "$restored_phase" != "Bound" ]; then
+    if [ "$restored_handle" != "$handle" ] || [ "$restored_phase" != "Bound" ] || \
+        ! longhorn_validate_existing_pv_pvc_binding "$namespace" "$pvc" "$pv" "$handle"; then
         print_error "PV/PVC validation failed after restoring $namespace/$pvc."
+        print_warning "PV ${pv} was left with reclaim policy Retain for manual recovery."
+        print_info "State record: $state_file"
+        return 1
+    fi
+    if ! longhorn_set_pv_reclaim_policy "$pv" "$original_reclaim_policy"; then
+        print_error "${namespace}/${pvc} data was restored, but PV ${pv} reclaim policy could not be returned to ${original_reclaim_policy}."
         print_info "State record: $state_file"
         return 1
     fi
@@ -5808,6 +5891,9 @@ longhorn_restore_application_pvcs() {
         print_successful "Application PVC batch restore completed without changing app manifests."
     elif [ "$cleanup_result" -ne 0 ]; then
         print_error "Batch restore cleanup was incomplete. Check workload replicas and Flux suspension state manually."
+    elif [ "$restore_result" -ne 0 ]; then
+        print_error "Application PVC batch restore did not complete. Not all PVCs were restored."
+        print_info "Review the restore state files and Longhorn volume status before retrying."
     fi
     [ "$restore_result" -eq 0 ] && [ "$cleanup_result" -eq 0 ]
 }
@@ -5873,7 +5959,7 @@ longhorn_restore_into_existing_pvc_impl() {
         return 1
     fi
 
-    local target_namespace target_pvc pvc_phase pv_name pv_handle pv_driver
+    local target_namespace target_pvc pvc_phase pv_name pv_handle pv_driver original_reclaim_policy
     local pvc_storage_class pvc_access_mode pv_capacity current_volume_size current_volume_state
     read -p "Target PVC namespace (default: ${namespaces[$selected]:-default}): " target_namespace
     target_namespace=${target_namespace:-${namespaces[$selected]:-default}}
@@ -5912,6 +5998,9 @@ longhorn_restore_into_existing_pvc_impl() {
     pv_handle=$(longhorn_kubectl get pv "$pv_name" -o jsonpath='{.spec.csi.volumeHandle}' 2>/dev/null)
     pv_driver=$(longhorn_kubectl get pv "$pv_name" -o jsonpath='{.spec.csi.driver}' 2>/dev/null)
     pv_capacity=$(longhorn_kubectl get pv "$pv_name" -o jsonpath='{.spec.capacity.storage}' 2>/dev/null)
+    original_reclaim_policy=$(longhorn_kubectl get pv "$pv_name" \
+        -o jsonpath='{.spec.persistentVolumeReclaimPolicy}' 2>/dev/null)
+    original_reclaim_policy=${original_reclaim_policy:-Delete}
     if [ "$pv_driver" != "driver.longhorn.io" ] || [ -z "$pv_handle" ]; then
         print_error "Target PV is not a Longhorn CSI PV: $pv_name"
         return 1
@@ -6021,6 +6110,7 @@ longhorn_restore_into_existing_pvc_impl() {
         echo "data_engine=$current_volume_engine"
         echo "access_mode=$current_volume_access_mode"
         echo "storage_class=$pvc_storage_class"
+        echo "original_reclaim_policy=$original_reclaim_policy"
     } > "$state_file"
     longhorn_kubectl get pvc "$target_pvc" -n "$target_namespace" -o yaml >> "$state_file" 2>/dev/null || true
     longhorn_kubectl get pv "$pv_name" -o yaml >> "$state_file" 2>/dev/null || true
@@ -6055,31 +6145,50 @@ EOF
 
     longhorn_validate_flux_suspended || return 1
 
+    if ! longhorn_set_pv_reclaim_policy "$pv_name" Retain; then
+        print_error "Restore stopped before deleting volume ${pv_handle}; PV/PVC binding was preserved."
+        print_info "State record: $state_file"
+        return 1
+    fi
     if ! longhorn_kubectl delete volume "$pv_handle" -n longhorn-system --wait=true --timeout=180s; then
         print_error "Could not delete the existing empty Longhorn volume. Nothing was restored."
+        print_warning "PV ${pv_name} was left with reclaim policy Retain for manual recovery."
         return 1
     fi
     if longhorn_kubectl get volume "$pv_handle" -n longhorn-system &>/dev/null; then
         print_error "The old Longhorn volume still exists. Restore was not attempted."
+        print_warning "PV ${pv_name} was left with reclaim policy Retain for manual recovery."
         return 1
     fi
-    if ! longhorn_kubectl get pv "$pv_name" &>/dev/null || ! longhorn_kubectl get pvc "$target_pvc" -n "$target_namespace" &>/dev/null; then
-        print_error "The existing PV/PVC did not remain available after volume deletion."
+    if ! longhorn_validate_existing_pv_pvc_binding "$target_namespace" "$target_pvc" "$pv_name" "$pv_handle"; then
+        print_error "The existing PV/PVC binding did not remain Bound after volume deletion."
+        print_warning "PV ${pv_name} was left with reclaim policy Retain for manual recovery."
         print_info "Use the saved state record to recover the binding: $state_file"
         return 1
     fi
 
-    longhorn_kubectl apply -f "$restore_manifest" || return 1
+    if ! longhorn_kubectl apply -f "$restore_manifest"; then
+        print_error "Could not apply the restore manifest for ${target_namespace}/${target_pvc}."
+        print_warning "PV ${pv_name} was left with reclaim policy Retain for manual recovery."
+        return 1
+    fi
     print_successful "Restore requested using the existing PV volume handle: $pv_handle"
     longhorn_wait_for_restore_detached "$pv_handle" 1800 || return 1
 
     local restored_handle restored_phase
     restored_handle=$(longhorn_kubectl get pv "$pv_name" -o jsonpath='{.spec.csi.volumeHandle}' 2>/dev/null)
     restored_phase=$(longhorn_kubectl get pvc "$target_pvc" -n "$target_namespace" -o jsonpath='{.status.phase}' 2>/dev/null)
-    if [ "$restored_handle" != "$pv_handle" ] || [ "$restored_phase" != "Bound" ]; then
+    if [ "$restored_handle" != "$pv_handle" ] || [ "$restored_phase" != "Bound" ] || \
+        ! longhorn_validate_existing_pv_pvc_binding "$target_namespace" "$target_pvc" "$pv_name" "$pv_handle"; then
         print_error "PV/PVC validation failed after restore."
         echo "  PV handle: $restored_handle"
         echo "  PVC phase: $restored_phase"
+        print_warning "PV ${pv_name} was left with reclaim policy Retain for manual recovery."
+        print_info "The saved state record is available at: $state_file"
+        return 1
+    fi
+    if ! longhorn_set_pv_reclaim_policy "$pv_name" "$original_reclaim_policy"; then
+        print_error "Storage data was restored, but PV ${pv_name} reclaim policy could not be returned to ${original_reclaim_policy}."
         print_info "The saved state record is available at: $state_file"
         return 1
     fi
