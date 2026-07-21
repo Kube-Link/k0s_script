@@ -47,7 +47,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.88"
+SCRIPT_VERSION="1.0.90"
 
 # Flux bootstrap defaults. These are saved to the cluster config after the
 # first interactive bootstrap so upgrades can reuse the exact same component set.
@@ -5732,14 +5732,6 @@ longhorn_restore_batch_volume() {
         -o jsonpath='{.spec.persistentVolumeReclaimPolicy}' 2>/dev/null)
     original_reclaim_policy=${original_reclaim_policy:-Delete}
 
-    if [ "$old_handle" = "$restore_handle" ]; then
-        if longhorn_validate_existing_pv_pvc_binding "$namespace" "$pvc" "$pv" "$restore_handle"; then
-            print_successful "${namespace}/${pvc} is already rebound to restored volume ${restore_handle}; leaving it unchanged."
-            return 0
-        fi
-        print_error "${namespace}/${pvc} already uses restore handle ${restore_handle}, but its PV/PVC binding is invalid."
-        return 1
-    fi
     requested_size=${requested_size:-$pv_capacity}
     volume_mode=${volume_mode:-Filesystem}
     fs_type=${fs_type:-ext4}
@@ -5784,6 +5776,24 @@ longhorn_restore_batch_volume() {
     } > "$state_file"
     longhorn_kubectl get pvc "$pvc" -n "$namespace" -o yaml >> "$state_file" 2>/dev/null || true
     longhorn_kubectl get pv "$pv" -o yaml >> "$state_file" 2>/dev/null || true
+
+    if [ "$old_handle" = "$restore_handle" ]; then
+        if ! longhorn_validate_existing_pv_pvc_binding "$namespace" "$pvc" "$pv" "$restore_handle"; then
+            print_error "${namespace}/${pvc} already uses restore handle ${restore_handle}, but its PV/PVC binding is invalid."
+            return 1
+        fi
+        print_info "${namespace}/${pvc} is already rebound; refreshing external PVC field ownership."
+        if ! longhorn_kubectl apply --field-manager=flux-client-side-apply -f "$binding_manifest"; then
+            print_error "Could not refresh external field ownership for ${namespace}/${pvc}."
+            return 1
+        fi
+        if ! longhorn_validate_existing_pv_pvc_binding "$namespace" "$pvc" "$pv" "$restore_handle"; then
+            print_error "PV/PVC binding validation failed after refreshing ${namespace}/${pvc}."
+            return 1
+        fi
+        print_successful "Refreshed restored binding for $namespace/$pvc -> $pv -> $restore_handle"
+        return 0
+    fi
 
     print_info "Rebinding $namespace/$pvc from ${old_handle} to restored volume ${restore_handle}..."
     longhorn_wait_for_volume_detached "$old_handle" 180 || return 1
@@ -5874,7 +5884,7 @@ ${access_modes_yaml}
       storage: ${requested_size}
 EOF
 
-    if ! longhorn_kubectl apply -f "$binding_manifest"; then
+    if ! longhorn_kubectl apply --field-manager=flux-client-side-apply -f "$binding_manifest"; then
         print_error "Could not create the replacement PV/PVC binding for ${namespace}/${pvc}."
         print_warning "Flux remains suspended and the restore state is recorded at ${state_file}."
         return 1
