@@ -47,7 +47,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.84"
+SCRIPT_VERSION="1.0.85"
 
 # Flux bootstrap defaults. These are saved to the cluster config after the
 # first interactive bootstrap so upgrades can reuse the exact same component set.
@@ -4961,6 +4961,35 @@ longhorn_namespace_pvc_names() {
         -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null
 }
 
+longhorn_application_pvc_names() {
+    local namespace="$1"
+    local pvc workload claims declared_pvc known_pvc known_pvc_name
+    local selected_pvcs=()
+
+    for pvc in $(longhorn_namespace_pvc_names "$namespace"); do
+        selected_pvcs+=("$pvc")
+    done
+
+    while IFS=$'\t' read -r workload claims; do
+        [ -n "$workload" ] || continue
+        IFS=',' read -ra declared_pvcs <<< "$claims"
+        for declared_pvc in "${declared_pvcs[@]}"; do
+            declared_pvc=$(trim_value "$declared_pvc")
+            [ -n "$declared_pvc" ] || continue
+            known_pvc=n
+            for known_pvc_name in "${selected_pvcs[@]}"; do
+                if [ "$known_pvc_name" = "$declared_pvc" ]; then
+                    known_pvc=y
+                    break
+                fi
+            done
+            [ "$known_pvc" = "n" ] && selected_pvcs+=("$declared_pvc")
+        done
+    done < <(longhorn_list_workloads_with_pvcs "$namespace")
+
+    printf '%s\n' "${selected_pvcs[@]}"
+}
+
 longhorn_find_flux_application() {
     local namespace="$1"
     local resource_name resource_namespace resource_target
@@ -5019,7 +5048,7 @@ longhorn_discover_applications() {
 
         workload_lines=$(longhorn_list_workloads_with_pvcs "$namespace")
         [ -n "$workload_lines" ] || continue
-        pvc_names=$(longhorn_namespace_pvc_names "$namespace")
+        pvc_names=$(longhorn_application_pvc_names "$namespace")
         [ -n "$pvc_names" ] || continue
 
         workloads_display=$(printf '%s\n' "$workload_lines" | awk -F '\t' \
@@ -5190,6 +5219,8 @@ longhorn_suspend_flux_resource() {
     local name="$2"
     local namespace="$3"
     local suspended
+
+    LONGHORN_RESTORE_OPERATION_STARTED=y
 
     LONGHORN_FLUX_GUARDED_KINDS+=("$kind")
     LONGHORN_FLUX_GUARDED_NAMES+=("$name")
@@ -5506,34 +5537,154 @@ longhorn_validate_existing_pv_pvc_binding() {
         [ "$claim_namespace" = "$namespace" ] && [ "$claim_name" = "$pvc_name" ]
 }
 
-longhorn_restore_batch_volume() {
+longhorn_restore_volume_name() {
+    local namespace="$1"
+    local pvc_name="$2"
+    local backup_name="$3"
+    local restore_name
+
+    restore_name=$(sanitize_k8s_name "restore-${namespace}-${pvc_name}-${backup_name}")
+    if [ "${#restore_name}" -gt 63 ]; then
+        restore_name="${restore_name:0:63}"
+        restore_name="${restore_name%-}"
+    fi
+    printf '%s' "$restore_name"
+}
+
+longhorn_wait_for_pvc_binding() {
+    local namespace="$1"
+    local pvc_name="$2"
+    local pv_name="$3"
+    local volume_handle="$4"
+    local timeout_seconds="${5:-180}"
+    local deadline=$((SECONDS + timeout_seconds))
+
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if longhorn_validate_existing_pv_pvc_binding "$namespace" "$pvc_name" "$pv_name" "$volume_handle"; then
+            print_successful "PVC ${namespace}/${pvc_name} is bound to restored volume ${volume_handle}."
+            return 0
+        fi
+
+        print_info "Waiting for PVC ${namespace}/${pvc_name} to bind to restored volume ${volume_handle}..."
+        sleep 5
+    done
+
+    print_error "Timed out waiting for PVC ${namespace}/${pvc_name} to bind to restored volume ${volume_handle}."
+    return 1
+}
+
+longhorn_prepare_restore_volume() {
     local index="$1"
     local namespace="$LONGHORN_RESTORE_WORKLOAD_NAMESPACE"
     local pvc="${LONGHORN_BATCH_PVCS[$index]}"
-    local pv="${LONGHORN_BATCH_PVS[$index]}"
-    local handle="${LONGHORN_BATCH_HANDLES[$index]}"
+    local restore_handle="${LONGHORN_BATCH_RESTORE_HANDLES[$index]}"
     local backup="${LONGHORN_BATCH_BACKUPS[$index]}"
     local url="${LONGHORN_BATCH_URLS[$index]}"
     local size="${LONGHORN_BATCH_SIZES[$index]}"
     local replicas="${LONGHORN_BATCH_REPLICAS[$index]}"
     local engine="${LONGHORN_BATCH_ENGINES[$index]}"
     local access="${LONGHORN_BATCH_ACCESS_MODES[$index]}"
-    local prefix state_file manifest restored_handle restored_phase
+    local manifest existing_url existing_size
+
+    manifest="./longhorn-restore-${restore_handle}.yaml"
+    cat > "$manifest" << EOF
+apiVersion: longhorn.io/v1beta2
+kind: Volume
+metadata:
+  name: ${restore_handle}
+  namespace: longhorn-system
+spec:
+  size: "${size}"
+  fromBackup: "${url}"
+  numberOfReplicas: ${replicas}
+  frontend: blockdev
+  dataEngine: ${engine}
+  accessMode: ${access}
+EOF
+
+    if longhorn_kubectl get volume "$restore_handle" -n longhorn-system &>/dev/null; then
+        existing_url=$(longhorn_kubectl get volume "$restore_handle" -n longhorn-system \
+            -o jsonpath='{.spec.fromBackup}' 2>/dev/null)
+        existing_size=$(longhorn_kubectl get volume "$restore_handle" -n longhorn-system \
+            -o jsonpath='{.spec.size}' 2>/dev/null)
+        if [ "$existing_url" != "$url" ] || [ "$existing_size" != "$size" ]; then
+            print_error "Restore volume ${restore_handle} already exists with different backup or size."
+            print_info "Manifest: $manifest"
+            return 1
+        fi
+        print_info "Reusing existing restore volume ${restore_handle} for ${namespace}/${pvc}."
+        return 0
+    fi
+
+    print_info "Creating restore volume ${restore_handle} for ${namespace}/${pvc} from ${backup}..."
+    if ! longhorn_kubectl apply -f "$manifest"; then
+        print_error "Could not create restore volume ${restore_handle} for ${namespace}/${pvc}."
+        print_info "Manifest: $manifest"
+        return 1
+    fi
+}
+
+longhorn_restore_batch_volume() {
+    local index="$1"
+    local namespace="$LONGHORN_RESTORE_WORKLOAD_NAMESPACE"
+    local pvc="${LONGHORN_BATCH_PVCS[$index]}"
+    local pv="${LONGHORN_BATCH_PVS[$index]}"
+    local old_handle="${LONGHORN_BATCH_HANDLES[$index]}"
+    local restore_handle="${LONGHORN_BATCH_RESTORE_HANDLES[$index]}"
+    local backup="${LONGHORN_BATCH_BACKUPS[$index]}"
+    local url="${LONGHORN_BATCH_URLS[$index]}"
+    local size="${LONGHORN_BATCH_SIZES[$index]}"
+    local replicas="${LONGHORN_BATCH_REPLICAS[$index]}"
+    local engine="${LONGHORN_BATCH_ENGINES[$index]}"
+    local access="${LONGHORN_BATCH_ACCESS_MODES[$index]}"
+    local storage_class="${LONGHORN_BATCH_STORAGE_CLASSES[$index]}"
+    local pv_capacity="${LONGHORN_BATCH_PV_CAPACITIES[$index]}"
+    local requested_size="${LONGHORN_BATCH_REQUESTED_SIZES[$index]}"
+    local volume_mode="${LONGHORN_BATCH_VOLUME_MODES[$index]}"
+    local pv_access_modes="${LONGHORN_BATCH_PV_ACCESS_MODES[$index]}"
+    local fs_type="${LONGHORN_BATCH_FS_TYPES[$index]}"
+    local backup_target="${LONGHORN_BATCH_BACKUP_TARGETS[$index]}"
+    local data_locality="${LONGHORN_BATCH_DATA_LOCALITIES[$index]}"
+    local disable_revision_counter="${LONGHORN_BATCH_DISABLE_REVISION_COUNTERS[$index]}"
+    local unmap_mark_snap_chain_removed="${LONGHORN_BATCH_UNMAP_MARK_SNAP_CHAIN_REMOVED[$index]}"
+    local stale_replica_timeout="${LONGHORN_BATCH_STALE_REPLICA_TIMEOUTS[$index]}"
+    local prefix state_file volume_manifest binding_manifest restored_handle restored_phase
+    local access_modes_yaml
     local original_reclaim_policy
 
     original_reclaim_policy=$(longhorn_kubectl get pv "$pv" \
         -o jsonpath='{.spec.persistentVolumeReclaimPolicy}' 2>/dev/null)
     original_reclaim_policy=${original_reclaim_policy:-Delete}
 
+    if [ "$old_handle" = "$restore_handle" ]; then
+        if longhorn_validate_existing_pv_pvc_binding "$namespace" "$pvc" "$pv" "$restore_handle"; then
+            print_successful "${namespace}/${pvc} is already rebound to restored volume ${restore_handle}; leaving it unchanged."
+            return 0
+        fi
+        print_error "${namespace}/${pvc} already uses restore handle ${restore_handle}, but its PV/PVC binding is invalid."
+        return 1
+    fi
+    requested_size=${requested_size:-$pv_capacity}
+    volume_mode=${volume_mode:-Filesystem}
+    fs_type=${fs_type:-ext4}
+    backup_target=${backup_target:-default}
+    data_locality=${data_locality:-best-effort}
+    disable_revision_counter=${disable_revision_counter:-true}
+    unmap_mark_snap_chain_removed=${unmap_mark_snap_chain_removed:-ignored}
+    stale_replica_timeout=${stale_replica_timeout:-30}
+    access_modes_yaml=$(printf '%s\n' "$pv_access_modes" | sed '/^$/d; s/^/    - /')
+
     prefix=$(sanitize_k8s_name "$namespace-$pvc-$backup")
     state_file="./longhorn-existing-restore-$prefix.state"
-    manifest="./longhorn-existing-restore-$prefix.yaml"
+    volume_manifest="./longhorn-restore-${restore_handle}.yaml"
+    binding_manifest="./longhorn-rebind-$prefix.yaml"
     {
         echo "created_at=$(date -Iseconds 2>/dev/null || date)"
         echo "namespace=$namespace"
         echo "pvc=$pvc"
         echo "pv=$pv"
-        echo "volume_handle=$handle"
+        echo "old_volume_handle=$old_handle"
+        echo "restored_volume_handle=$restore_handle"
         echo "backup=$backup"
         echo "backup_source=${LONGHORN_BATCH_SOURCES[$index]}"
         echo "backup_url=$url"
@@ -5541,69 +5692,132 @@ longhorn_restore_batch_volume() {
         echo "replicas=$replicas"
         echo "data_engine=$engine"
         echo "access_mode=$access"
+        echo "storage_class=$storage_class"
+        echo "pv_capacity=$pv_capacity"
+        echo "requested_size=$requested_size"
+        echo "volume_mode=$volume_mode"
+        echo "fs_type=$fs_type"
+        echo "backup_target=$backup_target"
+        echo "data_locality=$data_locality"
+        echo "disable_revision_counter=$disable_revision_counter"
+        echo "unmap_mark_snap_chain_removed=$unmap_mark_snap_chain_removed"
+        echo "stale_replica_timeout=$stale_replica_timeout"
         echo "original_reclaim_policy=$original_reclaim_policy"
+        echo "volume_manifest=$volume_manifest"
+        echo "binding_manifest=$binding_manifest"
     } > "$state_file"
     longhorn_kubectl get pvc "$pvc" -n "$namespace" -o yaml >> "$state_file" 2>/dev/null || true
     longhorn_kubectl get pv "$pv" -o yaml >> "$state_file" 2>/dev/null || true
 
-    cat > "$manifest" << EOF
-apiVersion: longhorn.io/v1beta2
-kind: Volume
+    print_info "Rebinding $namespace/$pvc from ${old_handle} to restored volume ${restore_handle}..."
+    longhorn_wait_for_volume_detached "$old_handle" 180 || return 1
+    if ! longhorn_set_pv_reclaim_policy "$pv" Retain; then
+        print_error "Restore stopped before deleting the old PV/PVC binding."
+        print_info "State record: $state_file"
+        return 1
+    fi
+
+    if ! longhorn_kubectl delete pvc "$pvc" -n "$namespace" --wait=true --timeout=180s; then
+        print_error "Could not delete the old PVC ${namespace}/${pvc} before rebinding."
+        print_warning "PV ${pv} was left with reclaim policy Retain for manual recovery."
+        return 1
+    fi
+    if longhorn_kubectl get pvc "$pvc" -n "$namespace" &>/dev/null; then
+        print_error "The old PVC ${namespace}/${pvc} still exists; restore was stopped before deleting the old PV."
+        print_warning "PV ${pv} was left with reclaim policy Retain for manual recovery."
+        return 1
+    fi
+
+    if longhorn_kubectl get volume "$old_handle" -n longhorn-system &>/dev/null; then
+        if ! longhorn_kubectl delete volume "$old_handle" -n longhorn-system --wait=true --timeout=180s; then
+            print_error "Could not delete the old Longhorn volume ${old_handle}."
+            print_warning "PVC ${namespace}/${pvc} was deleted and Flux remains suspended for manual recovery."
+            return 1
+        fi
+        if longhorn_kubectl get volume "$old_handle" -n longhorn-system &>/dev/null; then
+            print_error "The old Longhorn volume still exists: ${old_handle}."
+            print_warning "PVC ${namespace}/${pvc} was deleted and Flux remains suspended for manual recovery."
+            return 1
+        fi
+    fi
+
+    if longhorn_kubectl get pv "$pv" &>/dev/null; then
+        if ! longhorn_kubectl delete pv "$pv" --wait=true --timeout=180s; then
+            print_error "Could not delete the old PV ${pv} before rebinding."
+            print_warning "PVC ${namespace}/${pvc} was deleted and Flux remains suspended for manual recovery."
+            return 1
+        fi
+        if longhorn_kubectl get pv "$pv" &>/dev/null; then
+            print_error "The old PV ${pv} still exists; restore was stopped before creating the replacement binding."
+            print_warning "PVC ${namespace}/${pvc} was deleted and Flux remains suspended for manual recovery."
+            return 1
+        fi
+    fi
+
+    cat > "$binding_manifest" << EOF
+apiVersion: v1
+kind: PersistentVolume
 metadata:
-  name: $handle
-  namespace: longhorn-system
+  name: ${pv}
+  annotations:
+    pv.kubernetes.io/provisioned-by: driver.longhorn.io
 spec:
-  size: "$size"
-  fromBackup: "$url"
-  numberOfReplicas: $replicas
-  frontend: blockdev
-  dataEngine: $engine
-  accessMode: $access
+  capacity:
+    storage: ${pv_capacity}
+  volumeMode: ${volume_mode}
+  accessModes:
+${access_modes_yaml}
+  persistentVolumeReclaimPolicy: ${original_reclaim_policy}
+  storageClassName: ${storage_class}
+  csi:
+    driver: driver.longhorn.io
+    fsType: ${fs_type}
+    volumeAttributes:
+      backupTargetName: "${backup_target}"
+    dataLocality: "${data_locality}"
+      dataEngine: "${engine}"
+    disableRevisionCounter: "${disable_revision_counter}"
+      numberOfReplicas: "${replicas}"
+    staleReplicaTimeout: "${stale_replica_timeout}"
+    unmapMarkSnapChainRemoved: "${unmap_mark_snap_chain_removed}"
+    volumeHandle: ${restore_handle}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ${pvc}
+  namespace: ${namespace}
+spec:
+  accessModes:
+${access_modes_yaml}
+  storageClassName: ${storage_class}
+  volumeName: ${pv}
+  volumeMode: ${volume_mode}
+  resources:
+    requests:
+      storage: ${requested_size}
 EOF
 
-    print_info "Restoring $namespace/$pvc from $backup..."
-    if ! longhorn_set_pv_reclaim_policy "$pv" Retain; then
-        print_error "Restore stopped before deleting volume ${handle}; PV/PVC binding was preserved."
-        print_info "State record: $state_file"
+    if ! longhorn_kubectl apply -f "$binding_manifest"; then
+        print_error "Could not create the replacement PV/PVC binding for ${namespace}/${pvc}."
+        print_warning "Flux remains suspended and the restore state is recorded at ${state_file}."
         return 1
     fi
-    if ! longhorn_kubectl delete volume "$handle" -n longhorn-system --wait=true --timeout=180s; then
-        print_error "Could not delete the existing Longhorn volume ${handle}."
-        print_warning "PV ${pv} was left with reclaim policy Retain for manual recovery."
+    if ! longhorn_wait_for_pvc_binding "$namespace" "$pvc" "$pv" "$restore_handle" 180; then
+        print_error "Replacement PV/PVC binding failed for ${namespace}/${pvc}."
+        print_warning "Flux remains suspended and the restore state is recorded at ${state_file}."
         return 1
     fi
-    if longhorn_kubectl get volume "$handle" -n longhorn-system &>/dev/null; then
-        print_error "The old Longhorn volume still exists: $handle"
-        print_warning "PV ${pv} was left with reclaim policy Retain for manual recovery."
-        return 1
-    fi
-    if ! longhorn_validate_existing_pv_pvc_binding "$namespace" "$pvc" "$pv" "$handle"; then
-        print_error "The PV/PVC binding did not remain Bound for $namespace/$pvc after deleting the old volume."
-        print_warning "PV ${pv} was left with reclaim policy Retain for manual recovery."
-        print_info "State record: $state_file"
-        return 1
-    fi
-    if ! longhorn_kubectl apply -f "$manifest"; then
-        print_error "Could not apply the restore manifest for ${namespace}/${pvc}."
-        print_warning "PV ${pv} was left with reclaim policy Retain for manual recovery."
-        return 1
-    fi
-    longhorn_wait_for_restore_detached "$handle" 1800 || return 1
+
     restored_handle=$(longhorn_kubectl get pv "$pv" -o jsonpath='{.spec.csi.volumeHandle}' 2>/dev/null)
     restored_phase=$(longhorn_kubectl get pvc "$pvc" -n "$namespace" -o jsonpath='{.status.phase}' 2>/dev/null)
-    if [ "$restored_handle" != "$handle" ] || [ "$restored_phase" != "Bound" ] || \
-        ! longhorn_validate_existing_pv_pvc_binding "$namespace" "$pvc" "$pv" "$handle"; then
-        print_error "PV/PVC validation failed after restoring $namespace/$pvc."
-        print_warning "PV ${pv} was left with reclaim policy Retain for manual recovery."
-        print_info "State record: $state_file"
+    if [ "$restored_handle" != "$restore_handle" ] || [ "$restored_phase" != "Bound" ]; then
+        print_error "Replacement PV/PVC validation failed after restoring ${namespace}/${pvc}."
+        print_warning "Flux remains suspended and the restore state is recorded at ${state_file}."
         return 1
     fi
-    if ! longhorn_set_pv_reclaim_policy "$pv" "$original_reclaim_policy"; then
-        print_error "${namespace}/${pvc} data was restored, but PV ${pv} reclaim policy could not be returned to ${original_reclaim_policy}."
-        print_info "State record: $state_file"
-        return 1
-    fi
-    print_successful "Restored and validated $namespace/$pvc -> $pv -> $handle"
+
+    print_successful "Restored and rebound $namespace/$pvc -> $pv -> $restore_handle"
 }
 
 longhorn_restore_application_pvcs_impl() {
@@ -5645,7 +5859,7 @@ longhorn_restore_application_pvcs_impl() {
     local application_pvcs="${LONGHORN_APPLICATION_PVCS[$selected_index]}"
     local flux_source="${LONGHORN_APPLICATION_FLUX_SOURCES[$selected_index]}"
     local target_pvcs=()
-    mapfile -t target_pvcs < <(longhorn_namespace_pvc_names "$namespace")
+    mapfile -t target_pvcs < <(longhorn_application_pvc_names "$namespace")
     if [ "${#target_pvcs[@]}" -eq 0 ]; then
         print_error "Application namespace $namespace has no PVCs."
         return 1
@@ -5668,10 +5882,24 @@ longhorn_restore_application_pvcs_impl() {
     LONGHORN_BATCH_REPLICAS=()
     LONGHORN_BATCH_ENGINES=()
     LONGHORN_BATCH_ACCESS_MODES=()
+    LONGHORN_BATCH_RESTORE_HANDLES=()
+    LONGHORN_BATCH_STORAGE_CLASSES=()
+    LONGHORN_BATCH_PV_CAPACITIES=()
+    LONGHORN_BATCH_REQUESTED_SIZES=()
+    LONGHORN_BATCH_VOLUME_MODES=()
+    LONGHORN_BATCH_PV_ACCESS_MODES=()
+    LONGHORN_BATCH_FS_TYPES=()
+    LONGHORN_BATCH_BACKUP_TARGETS=()
+    LONGHORN_BATCH_DATA_LOCALITIES=()
+    LONGHORN_BATCH_DISABLE_REVISION_COUNTERS=()
+    LONGHORN_BATCH_UNMAP_MARK_SNAP_CHAIN_REMOVED=()
+    LONGHORN_BATCH_STALE_REPLICA_TIMEOUTS=()
 
     local plan_pvcs=() plan_pvs=() plan_sources=() plan_backups=() plan_backup_ats=() plan_sizes=() plan_statuses=()
     local preflight_failed=n
     local pvc phase pv driver handle current_size current_replicas current_engine current_access
+    local storage_class pv_capacity requested_size volume_mode pv_access_modes fs_type backup_target
+    local data_locality disable_revision_counter unmap_mark_snap_chain_removed stale_replica_timeout
     local source_volume latest_backup last_backup_at source_size access_mode
     local backup_match_count backup_matches=() backup_match
     local plan_pv plan_source plan_backup plan_backup_at plan_size plan_status
@@ -5687,6 +5915,18 @@ longhorn_restore_application_pvcs_impl() {
         phase=$(longhorn_kubectl get pvc "$pvc" -n "$namespace" -o jsonpath='{.status.phase}' 2>/dev/null)
         pv=$(longhorn_kubectl get pvc "$pvc" -n "$namespace" -o jsonpath='{.spec.volumeName}' 2>/dev/null)
         plan_pv="${pv:--}"
+        if ! longhorn_kubectl get pvc "$pvc" -n "$namespace" &>/dev/null; then
+            plan_status="PVC MISSING"
+            preflight_failed=y
+            plan_pvcs+=("$pvc")
+            plan_pvs+=("$plan_pv")
+            plan_sources+=("$plan_source")
+            plan_backups+=("$plan_backup")
+            plan_backup_ats+=("$plan_backup_at")
+            plan_sizes+=("$plan_size")
+            plan_statuses+=("$plan_status")
+            continue
+        fi
         if [ "$phase" != "Bound" ] || [ -z "$pv" ]; then
             plan_status="NOT BOUND"
             preflight_failed=y
@@ -5736,6 +5976,34 @@ longhorn_restore_application_pvcs_impl() {
         current_engine=${current_engine:-v1}
         current_access=${current_access:-rwo}
         plan_size="${current_size:--}"
+        storage_class=$(longhorn_kubectl get pv "$pv" -o jsonpath='{.spec.storageClassName}' 2>/dev/null)
+        pv_capacity=$(longhorn_kubectl get pv "$pv" -o jsonpath='{.spec.capacity.storage}' 2>/dev/null)
+        requested_size=$(longhorn_kubectl get pvc "$pvc" -n "$namespace" \
+            -o jsonpath='{.spec.resources.requests.storage}' 2>/dev/null)
+        volume_mode=$(longhorn_kubectl get pv "$pv" -o jsonpath='{.spec.volumeMode}' 2>/dev/null)
+        pv_access_modes=$(longhorn_kubectl get pvc "$pvc" -n "$namespace" \
+            -o jsonpath='{range .spec.accessModes[*]}{.}{"\n"}{end}' 2>/dev/null)
+        fs_type=$(longhorn_kubectl get pv "$pv" -o jsonpath='{.spec.csi.fsType}' 2>/dev/null)
+        data_locality=$(longhorn_kubectl get pv "$pv" \
+            -o jsonpath='{.spec.csi.volumeAttributes.dataLocality}' 2>/dev/null)
+        disable_revision_counter=$(longhorn_kubectl get pv "$pv" \
+            -o jsonpath='{.spec.csi.volumeAttributes.disableRevisionCounter}' 2>/dev/null)
+        unmap_mark_snap_chain_removed=$(longhorn_kubectl get pv "$pv" \
+            -o jsonpath='{.spec.csi.volumeAttributes.unmapMarkSnapChainRemoved}' 2>/dev/null)
+        stale_replica_timeout=$(longhorn_kubectl get pv "$pv" \
+            -o jsonpath='{.spec.csi.volumeAttributes.staleReplicaTimeout}' 2>/dev/null)
+        backup_target=$(longhorn_kubectl get storageclass "$storage_class" \
+            -o jsonpath='{.parameters.backupTargetName}' 2>/dev/null)
+        storage_class=${storage_class:-longhorn}
+        requested_size=${requested_size:-$pv_capacity}
+        volume_mode=${volume_mode:-Filesystem}
+        pv_access_modes=${pv_access_modes:-ReadWriteOnce}
+        fs_type=${fs_type:-ext4}
+        backup_target=${backup_target:-default}
+        data_locality=${data_locality:-best-effort}
+        disable_revision_counter=${disable_revision_counter:-true}
+        unmap_mark_snap_chain_removed=${unmap_mark_snap_chain_removed:-ignored}
+        stale_replica_timeout=${stale_replica_timeout:-30}
 
         mapfile -t backup_matches < <(longhorn_backup_sources_for_pvc "$namespace" "$pvc")
         backup_match_count=${#backup_matches[@]}
@@ -5760,6 +6028,9 @@ longhorn_restore_application_pvcs_impl() {
             elif [ -z "$LONGHORN_SELECTED_BACKUP_URL" ] || [ -z "$LONGHORN_SELECTED_BACKUP_SIZE" ]; then
                 plan_status="INVALID BACKUP RECORD"
                 preflight_failed=y
+            elif [ -z "$pv_capacity" ] || [ -z "$requested_size" ]; then
+                plan_status="PV SPEC INCOMPLETE"
+                preflight_failed=y
             elif printf '%s' "$LONGHORN_SELECTED_BACKUP_SIZE" | grep -Eq '^[0-9]+$' && \
                 printf '%s' "$current_size" | grep -Eq '^[0-9]+$' && \
                 [ "$LONGHORN_SELECTED_BACKUP_SIZE" -ne "$current_size" ]; then
@@ -5776,6 +6047,18 @@ longhorn_restore_application_pvcs_impl() {
                 LONGHORN_BATCH_REPLICAS+=("$current_replicas")
                 LONGHORN_BATCH_ENGINES+=("$current_engine")
                 LONGHORN_BATCH_ACCESS_MODES+=("${access_mode:-rwo}")
+                LONGHORN_BATCH_RESTORE_HANDLES+=("$(longhorn_restore_volume_name "$namespace" "$pvc" "$LONGHORN_SELECTED_BACKUP")")
+                LONGHORN_BATCH_STORAGE_CLASSES+=("$storage_class")
+                LONGHORN_BATCH_PV_CAPACITIES+=("$pv_capacity")
+                LONGHORN_BATCH_REQUESTED_SIZES+=("$requested_size")
+                LONGHORN_BATCH_VOLUME_MODES+=("$volume_mode")
+                LONGHORN_BATCH_PV_ACCESS_MODES+=("$pv_access_modes")
+                LONGHORN_BATCH_FS_TYPES+=("$fs_type")
+                LONGHORN_BATCH_BACKUP_TARGETS+=("$backup_target")
+                LONGHORN_BATCH_DATA_LOCALITIES+=("$data_locality")
+                LONGHORN_BATCH_DISABLE_REVISION_COUNTERS+=("$disable_revision_counter")
+                LONGHORN_BATCH_UNMAP_MARK_SNAP_CHAIN_REMOVED+=("$unmap_mark_snap_chain_removed")
+                LONGHORN_BATCH_STALE_REPLICA_TIMEOUTS+=("$stale_replica_timeout")
             fi
         fi
 
@@ -5831,6 +6114,7 @@ longhorn_restore_application_pvcs_impl() {
         done
     fi
 
+    LONGHORN_RESTORE_OPERATION_STARTED=y
     longhorn_suspend_application_flux_resources "$namespace" || return 1
     if [ "$running" = "y" ]; then
         for ((plan_index = 0; plan_index < ${#LONGHORN_RESTORE_WORKLOADS[@]}; plan_index++)); do
@@ -5849,7 +6133,12 @@ longhorn_restore_application_pvcs_impl() {
     longhorn_validate_flux_suspended || return 1
     local restore_index
     for ((restore_index = 0; restore_index < ${#LONGHORN_BATCH_PVCS[@]}; restore_index++)); do
-        longhorn_wait_for_volume_detached "${LONGHORN_BATCH_HANDLES[$restore_index]}" 180 || return 1
+        longhorn_prepare_restore_volume "$restore_index" || return 1
+    done
+    for ((restore_index = 0; restore_index < ${#LONGHORN_BATCH_PVCS[@]}; restore_index++)); do
+        longhorn_wait_for_restore_detached "${LONGHORN_BATCH_RESTORE_HANDLES[$restore_index]}" 1800 || return 1
+    done
+    for ((restore_index = 0; restore_index < ${#LONGHORN_BATCH_PVCS[@]}; restore_index++)); do
         longhorn_restore_batch_volume "$restore_index" || return 1
     done
     LONGHORN_RESTORE_TARGET_NAMESPACE="$namespace"
@@ -5870,12 +6159,22 @@ longhorn_restore_application_pvcs() {
     LONGHORN_RESTORE_TARGET_NAMESPACE=""
     LONGHORN_RESTORE_TARGET_PVC=""
     LONGHORN_RESTORE_WORKLOADS_SCALED=n
+    LONGHORN_RESTORE_OPERATION_STARTED=n
 
     longhorn_restore_application_pvcs_impl
     local restore_result=$?
     if [ "$restore_result" -eq 2 ]; then
         print_info "Application PVC batch restore cancelled before any changes."
         return 0
+    fi
+    if [ "$restore_result" -ne 0 ]; then
+        print_error "Application PVC batch restore did not complete. Not all PVCs were restored."
+        if [ "$LONGHORN_RESTORE_OPERATION_STARTED" = "y" ]; then
+            print_warning "Flux remains suspended and workloads remain stopped for manual recovery."
+            print_info "Do not let Flux recreate the application PVCs until the restore state is reviewed."
+        fi
+        print_info "Review the restore state files and Longhorn volume status before retrying."
+        return 1
     fi
     local cleanup_result=0
     longhorn_restore_workloads || cleanup_result=1
@@ -5891,11 +6190,8 @@ longhorn_restore_application_pvcs() {
         print_successful "Application PVC batch restore completed without changing app manifests."
     elif [ "$cleanup_result" -ne 0 ]; then
         print_error "Batch restore cleanup was incomplete. Check workload replicas and Flux suspension state manually."
-    elif [ "$restore_result" -ne 0 ]; then
-        print_error "Application PVC batch restore did not complete. Not all PVCs were restored."
-        print_info "Review the restore state files and Longhorn volume status before retrying."
     fi
-    [ "$restore_result" -eq 0 ] && [ "$cleanup_result" -eq 0 ]
+    [ "$cleanup_result" -eq 0 ]
 }
 
 longhorn_restore_into_existing_pvc_impl() {
@@ -5960,7 +6256,9 @@ longhorn_restore_into_existing_pvc_impl() {
     fi
 
     local target_namespace target_pvc pvc_phase pv_name pv_handle pv_driver original_reclaim_policy
-    local pvc_storage_class pvc_access_mode pv_capacity current_volume_size current_volume_state
+    local pvc_storage_class pvc_access_mode pv_capacity requested_size volume_mode pv_access_modes fs_type backup_target
+    local data_locality disable_revision_counter unmap_mark_snap_chain_removed stale_replica_timeout
+    local current_volume_size current_volume_state
     read -p "Target PVC namespace (default: ${namespaces[$selected]:-default}): " target_namespace
     target_namespace=${target_namespace:-${namespaces[$selected]:-default}}
     read -p "Target PVC name (default: ${pvcs[$selected]}): " target_pvc
@@ -5998,9 +6296,34 @@ longhorn_restore_into_existing_pvc_impl() {
     pv_handle=$(longhorn_kubectl get pv "$pv_name" -o jsonpath='{.spec.csi.volumeHandle}' 2>/dev/null)
     pv_driver=$(longhorn_kubectl get pv "$pv_name" -o jsonpath='{.spec.csi.driver}' 2>/dev/null)
     pv_capacity=$(longhorn_kubectl get pv "$pv_name" -o jsonpath='{.spec.capacity.storage}' 2>/dev/null)
+    requested_size=$(longhorn_kubectl get pvc "$target_pvc" -n "$target_namespace" \
+        -o jsonpath='{.spec.resources.requests.storage}' 2>/dev/null)
+    volume_mode=$(longhorn_kubectl get pv "$pv_name" -o jsonpath='{.spec.volumeMode}' 2>/dev/null)
+    pv_access_modes=$(longhorn_kubectl get pvc "$target_pvc" -n "$target_namespace" \
+        -o jsonpath='{range .spec.accessModes[*]}{.}{"\n"}{end}' 2>/dev/null)
+    fs_type=$(longhorn_kubectl get pv "$pv_name" -o jsonpath='{.spec.csi.fsType}' 2>/dev/null)
+    data_locality=$(longhorn_kubectl get pv "$pv_name" \
+        -o jsonpath='{.spec.csi.volumeAttributes.dataLocality}' 2>/dev/null)
+    disable_revision_counter=$(longhorn_kubectl get pv "$pv_name" \
+        -o jsonpath='{.spec.csi.volumeAttributes.disableRevisionCounter}' 2>/dev/null)
+    unmap_mark_snap_chain_removed=$(longhorn_kubectl get pv "$pv_name" \
+        -o jsonpath='{.spec.csi.volumeAttributes.unmapMarkSnapChainRemoved}' 2>/dev/null)
+    stale_replica_timeout=$(longhorn_kubectl get pv "$pv_name" \
+        -o jsonpath='{.spec.csi.volumeAttributes.staleReplicaTimeout}' 2>/dev/null)
+    backup_target=$(longhorn_kubectl get storageclass "$pvc_storage_class" \
+        -o jsonpath='{.parameters.backupTargetName}' 2>/dev/null)
     original_reclaim_policy=$(longhorn_kubectl get pv "$pv_name" \
         -o jsonpath='{.spec.persistentVolumeReclaimPolicy}' 2>/dev/null)
     original_reclaim_policy=${original_reclaim_policy:-Delete}
+    requested_size=${requested_size:-$pv_capacity}
+    volume_mode=${volume_mode:-Filesystem}
+    pv_access_modes=${pv_access_modes:-ReadWriteOnce}
+    fs_type=${fs_type:-ext4}
+    backup_target=${backup_target:-default}
+    data_locality=${data_locality:-best-effort}
+    disable_revision_counter=${disable_revision_counter:-true}
+    unmap_mark_snap_chain_removed=${unmap_mark_snap_chain_removed:-ignored}
+    stale_replica_timeout=${stale_replica_timeout:-30}
     if [ "$pv_driver" != "driver.longhorn.io" ] || [ -z "$pv_handle" ]; then
         print_error "Target PV is not a Longhorn CSI PV: $pv_name"
         return 1
@@ -6084,7 +6407,6 @@ longhorn_restore_into_existing_pvc_impl() {
         longhorn_wait_for_pvc_pods_gone "$target_namespace" "$target_pvc" 180 || return 1
     fi
 
-    longhorn_wait_for_volume_detached "$pv_handle" 180 || return 1
     if printf '%s' "$selected_backup_size" | grep -Eq '^[0-9]+$' && printf '%s' "$current_volume_size" | grep -Eq '^[0-9]+$' && [ "$selected_backup_size" -ne "$current_volume_size" ]; then
         print_error "Backup size does not match the existing volume size."
         print_info "Existing: ${current_volume_size} bytes; backup: ${selected_backup_size} bytes."
@@ -6092,108 +6414,49 @@ longhorn_restore_into_existing_pvc_impl() {
         return 1
     fi
 
-    local state_prefix state_file restore_manifest
-    state_prefix=$(sanitize_k8s_name "${target_namespace}-${target_pvc}-${selected_backup}")
-    state_file="./longhorn-existing-restore-${state_prefix}.state"
-    restore_manifest="./longhorn-existing-restore-${state_prefix}.yaml"
-    {
-        echo "created_at=$(date -Iseconds 2>/dev/null || date)"
-        echo "namespace=$target_namespace"
-        echo "pvc=$target_pvc"
-        echo "pv=$pv_name"
-        echo "volume_handle=$pv_handle"
-        echo "backup=$selected_backup"
-        echo "backup_source=$selected_source"
-        echo "backup_url=$backup_url"
-        echo "backup_size=$selected_backup_size"
-        echo "replicas=$current_volume_replicas"
-        echo "data_engine=$current_volume_engine"
-        echo "access_mode=$current_volume_access_mode"
-        echo "storage_class=$pvc_storage_class"
-        echo "original_reclaim_policy=$original_reclaim_policy"
-    } > "$state_file"
-    longhorn_kubectl get pvc "$target_pvc" -n "$target_namespace" -o yaml >> "$state_file" 2>/dev/null || true
-    longhorn_kubectl get pv "$pv_name" -o yaml >> "$state_file" 2>/dev/null || true
-
-    cat > "$restore_manifest" << EOF
-apiVersion: longhorn.io/v1beta2
-kind: Volume
-metadata:
-  name: ${pv_handle}
-  namespace: longhorn-system
-spec:
-  size: "${selected_backup_size}"
-  fromBackup: "${backup_url}"
-  numberOfReplicas: ${current_volume_replicas}
-  frontend: blockdev
-  dataEngine: ${current_volume_engine}
-  accessMode: ${current_volume_access_mode}
-EOF
-
-    print_warning "The empty Longhorn volume ${pv_handle} will be deleted and replaced with the selected old backup."
-    print_warning "The existing PV/PVC are expected to remain unchanged and continue pointing to ${pv_handle}."
-    echo "  State record:   $state_file"
-    echo "  Restore file:   $restore_manifest"
+        local restore_handle
+        restore_handle=$(longhorn_restore_volume_name "$target_namespace" "$target_pvc" "$selected_backup")
+        print_warning "The selected backup will be restored into a new Longhorn volume ${restore_handle}."
+        print_warning "The existing PVC will then be rebound to that restored volume."
     echo "  Existing PV:    $pv_name"
     echo "  Existing PVC:   ${target_namespace}/${target_pvc}"
+        echo "  Restore volume: $restore_handle"
     echo ""
-    read -p "Type REPLACE to delete the empty volume and restore the old backup: " replace_confirm
+        read -p "Type REPLACE to restore and rebind the existing PVC: " replace_confirm
     if [ "$replace_confirm" != "REPLACE" ]; then
         print_info "Restore cancelled before changing the cluster."
         return 0
     fi
 
     longhorn_validate_flux_suspended || return 1
+    LONGHORN_RESTORE_OPERATION_STARTED=y
+    LONGHORN_BATCH_PVCS=("$target_pvc")
+    LONGHORN_BATCH_PVS=("$pv_name")
+    LONGHORN_BATCH_HANDLES=("$pv_handle")
+    LONGHORN_BATCH_RESTORE_HANDLES=("$restore_handle")
+    LONGHORN_BATCH_BACKUPS=("$selected_backup")
+    LONGHORN_BATCH_SOURCES=("$selected_source")
+    LONGHORN_BATCH_URLS=("$backup_url")
+    LONGHORN_BATCH_SIZES=("$selected_backup_size")
+    LONGHORN_BATCH_REPLICAS=("$current_volume_replicas")
+    LONGHORN_BATCH_ENGINES=("$current_volume_engine")
+    LONGHORN_BATCH_ACCESS_MODES=("$current_volume_access_mode")
+    LONGHORN_BATCH_STORAGE_CLASSES=("$pvc_storage_class")
+    LONGHORN_BATCH_PV_CAPACITIES=("$pv_capacity")
+    LONGHORN_BATCH_REQUESTED_SIZES=("$requested_size")
+    LONGHORN_BATCH_VOLUME_MODES=("$volume_mode")
+    LONGHORN_BATCH_PV_ACCESS_MODES=("$pv_access_modes")
+    LONGHORN_BATCH_FS_TYPES=("$fs_type")
+    LONGHORN_BATCH_BACKUP_TARGETS=("$backup_target")
+    LONGHORN_BATCH_DATA_LOCALITIES=("$data_locality")
+    LONGHORN_BATCH_DISABLE_REVISION_COUNTERS=("$disable_revision_counter")
+    LONGHORN_BATCH_UNMAP_MARK_SNAP_CHAIN_REMOVED=("$unmap_mark_snap_chain_removed")
+    LONGHORN_BATCH_STALE_REPLICA_TIMEOUTS=("$stale_replica_timeout")
 
-    if ! longhorn_set_pv_reclaim_policy "$pv_name" Retain; then
-        print_error "Restore stopped before deleting volume ${pv_handle}; PV/PVC binding was preserved."
-        print_info "State record: $state_file"
-        return 1
-    fi
-    if ! longhorn_kubectl delete volume "$pv_handle" -n longhorn-system --wait=true --timeout=180s; then
-        print_error "Could not delete the existing empty Longhorn volume. Nothing was restored."
-        print_warning "PV ${pv_name} was left with reclaim policy Retain for manual recovery."
-        return 1
-    fi
-    if longhorn_kubectl get volume "$pv_handle" -n longhorn-system &>/dev/null; then
-        print_error "The old Longhorn volume still exists. Restore was not attempted."
-        print_warning "PV ${pv_name} was left with reclaim policy Retain for manual recovery."
-        return 1
-    fi
-    if ! longhorn_validate_existing_pv_pvc_binding "$target_namespace" "$target_pvc" "$pv_name" "$pv_handle"; then
-        print_error "The existing PV/PVC binding did not remain Bound after volume deletion."
-        print_warning "PV ${pv_name} was left with reclaim policy Retain for manual recovery."
-        print_info "Use the saved state record to recover the binding: $state_file"
-        return 1
-    fi
-
-    if ! longhorn_kubectl apply -f "$restore_manifest"; then
-        print_error "Could not apply the restore manifest for ${target_namespace}/${target_pvc}."
-        print_warning "PV ${pv_name} was left with reclaim policy Retain for manual recovery."
-        return 1
-    fi
-    print_successful "Restore requested using the existing PV volume handle: $pv_handle"
-    longhorn_wait_for_restore_detached "$pv_handle" 1800 || return 1
-
-    local restored_handle restored_phase
-    restored_handle=$(longhorn_kubectl get pv "$pv_name" -o jsonpath='{.spec.csi.volumeHandle}' 2>/dev/null)
-    restored_phase=$(longhorn_kubectl get pvc "$target_pvc" -n "$target_namespace" -o jsonpath='{.status.phase}' 2>/dev/null)
-    if [ "$restored_handle" != "$pv_handle" ] || [ "$restored_phase" != "Bound" ] || \
-        ! longhorn_validate_existing_pv_pvc_binding "$target_namespace" "$target_pvc" "$pv_name" "$pv_handle"; then
-        print_error "PV/PVC validation failed after restore."
-        echo "  PV handle: $restored_handle"
-        echo "  PVC phase: $restored_phase"
-        print_warning "PV ${pv_name} was left with reclaim policy Retain for manual recovery."
-        print_info "The saved state record is available at: $state_file"
-        return 1
-    fi
-    if ! longhorn_set_pv_reclaim_policy "$pv_name" "$original_reclaim_policy"; then
-        print_error "Storage data was restored, but PV ${pv_name} reclaim policy could not be returned to ${original_reclaim_policy}."
-        print_info "The saved state record is available at: $state_file"
-        return 1
-    fi
-    print_successful "Existing PV/PVC binding is intact: ${target_namespace}/${target_pvc} -> ${pv_name} -> ${pv_handle}"
-    print_successful "Storage restore completed; cleanup will restore workloads and Flux reconciliation."
+    longhorn_prepare_restore_volume 0 || return 1
+    longhorn_wait_for_restore_detached "$restore_handle" 1800 || return 1
+    longhorn_restore_batch_volume 0 || return 1
+    print_successful "Existing PVC restored and rebound: ${target_namespace}/${target_pvc} -> ${pv_name} -> ${restore_handle}"
     return 0
 }
 
@@ -6210,9 +6473,18 @@ longhorn_restore_into_existing_pvc() {
     LONGHORN_RESTORE_TARGET_NAMESPACE=""
     LONGHORN_RESTORE_TARGET_PVC=""
     LONGHORN_RESTORE_WORKLOADS_SCALED=n
+    LONGHORN_RESTORE_OPERATION_STARTED=n
 
     longhorn_restore_into_existing_pvc_impl
     local restore_result=$?
+    if [ "$restore_result" -ne 0 ]; then
+        print_error "Existing-PVC restore did not complete."
+        if [ "$LONGHORN_RESTORE_OPERATION_STARTED" = "y" ]; then
+            print_warning "Flux remains suspended and workloads remain stopped for manual recovery."
+            print_info "Do not let Flux recreate the application PVC until the restore state is reviewed."
+        fi
+        return 1
+    fi
     local cleanup_result=0
 
     if ! longhorn_restore_workloads; then
