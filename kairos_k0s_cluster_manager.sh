@@ -47,7 +47,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.80"
+SCRIPT_VERSION="1.0.81"
 
 # Flux bootstrap defaults. These are saved to the cluster config after the
 # first interactive bootstrap so upgrades can reuse the exact same component set.
@@ -4606,10 +4606,10 @@ manage_flux() {
 # Longhorn backup inventory and selective restore
 # -----------------------------------------------------------------------------
 longhorn_kubectl() {
-    if command -v k0s &>/dev/null; then
-        k0s kubectl "$@"
-    elif command -v kubectl &>/dev/null; then
+    if command -v kubectl &>/dev/null; then
         KUBECONFIG="$K0S_KUBECONFIG" kubectl "$@"
+    elif command -v k0s &>/dev/null; then
+        k0s kubectl "$@"
     else
         print_error "kubectl/k0s not found. Cannot query the cluster."
         return 1
