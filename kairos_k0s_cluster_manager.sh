@@ -50,7 +50,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.93"
+SCRIPT_VERSION="1.0.94"
 
 # Flux bootstrap defaults. These are saved to the cluster config after the
 # first interactive bootstrap so upgrades can reuse the exact same component set.
@@ -7127,11 +7127,12 @@ external_storage_prepare_remote() {
     local mountpoint="$4"
     local label="${mountpoint##*/}"
 
-    external_storage_run_remote_script "$node_ip" "$device" "$force_format" "$label" <<'REMOTE'
+    external_storage_run_remote_script "$node_ip" "$device" "$force_format" "$label" "$mountpoint" <<'REMOTE'
 set -eu
 device="$1"
 force_format="$2"
 label="$3"
+mountpoint="$4"
 
 for command_name in lsblk blkid mkfs.ext4; do
     command -v "$command_name" >/dev/null 2>&1 || { echo "$command_name is required" >&2; exit 1; }
