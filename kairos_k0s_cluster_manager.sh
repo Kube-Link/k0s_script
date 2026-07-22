@@ -50,7 +50,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.97"
+SCRIPT_VERSION="1.0.98"
 
 # Flux bootstrap defaults. These are saved to the cluster config after the
 # first interactive bootstrap so upgrades can reuse the exact same component set.
@@ -1621,6 +1621,191 @@ EOF
 
     print_successful "Controller join cloud-config written to ${OUTPUT_FILE}"
     print_info "Installer target: http://${NODE_IP}:8080"
+}
+
+controller_rebuild_member_peer() {
+    local member_list="$1"
+    local member_name="$2"
+    local marker
+
+    marker="\"${member_name}\":\""
+    printf '%s\n' "$member_list" | tr ',' '\n' | awk -v marker="$marker" '
+        {
+            position = index($0, marker)
+            if (position) {
+                value = substr($0, position + length(marker))
+                sub(/".*$/, "", value)
+                print value
+                exit
+            }
+        }
+    '
+}
+
+controller_rebuild_workflow() {
+    local -a configured_controllers=("$CONTROLLER_IP" "${ADDITIONAL_CONTROLLERS[@]}")
+    local selection target_ip target_index target_name target_peer
+    local local_controller_ip=""
+    local member_list member_list_after member_status member_count
+    local token token_status confirm_remove inject_now
+    local attempt removed
+    local candidate_ip
+
+    if ! command -v k0s &>/dev/null; then
+        print_error "k0s is not available on this controller."
+        return 1
+    fi
+    if [ "${#configured_controllers[@]}" -lt 3 ]; then
+        print_error "Controller replacement requires at least 3 configured controllers."
+        return 1
+    fi
+
+    print_info "Controller rebuild / replacement"
+    print_warning "Run this from a surviving controller, never from the controller being rebuilt."
+    echo "Configured controllers:"
+    for candidate_ip in "${!configured_controllers[@]}"; do
+        printf '  %d. %s (%s)\n' "$((candidate_ip + 1))" \
+            "${CLUSTER_NAME}-ctrl-$((candidate_ip + 1))" "${configured_controllers[$candidate_ip]}"
+    done
+    read -r -p "Select the controller to rebuild: " selection || return 1
+
+    if [[ "$selection" =~ ^[0-9]+$ ]] && [ "$selection" -ge 1 ] && [ "$selection" -le "${#configured_controllers[@]}" ]; then
+        target_index="$selection"
+        target_ip="${configured_controllers[$((selection - 1))]}"
+    else
+        target_ip="$selection"
+        target_index=$(controller_index_for_ip "$target_ip")
+    fi
+    if [ -z "$target_ip" ] || [ -z "$target_index" ]; then
+        print_error "The selected controller is not in the configured controller list."
+        return 1
+    fi
+    target_name="${CLUSTER_NAME}-ctrl-${target_index}"
+
+    if command -v ip &>/dev/null; then
+        local local_addresses
+        local_addresses=$(ip -4 -o addr show 2>/dev/null)
+        for candidate_ip in "${configured_controllers[@]}"; do
+            if ip_output_contains_address "$local_addresses" "$candidate_ip"; then
+                local_controller_ip="$candidate_ip"
+                break
+            fi
+        done
+    fi
+    if [ -n "$local_controller_ip" ] && [ "$local_controller_ip" = "$target_ip" ]; then
+        print_error "Refusing to rebuild the controller running this menu: ${target_ip}."
+        print_info "Run the rebuild from controller 2 or controller 3."
+        return 1
+    fi
+
+    member_list=$(k0s etcd member-list 2>&1)
+    member_status=$?
+    if [ "$member_status" -ne 0 ]; then
+        print_error "Could not read the etcd member list."
+        echo "$member_list"
+        return 1
+    fi
+    member_count=$(printf '%s\n' "$member_list" | awk -F'https://' '{total += NF - 1} END {print total + 0}')
+    if [ "$member_count" -lt 2 ]; then
+        print_error "Only ${member_count} etcd member(s) are visible; refusing a controller replacement without quorum."
+        return 1
+    fi
+
+    target_peer=$(controller_rebuild_member_peer "$member_list" "$target_name")
+    if [ -z "$target_peer" ]; then
+        target_peer=$(printf '%s\n' "$member_list" | tr ',' '\n' | awk -v peer="https://${target_ip}:2380" '
+            index($0, peer) { print peer; exit }
+        ')
+    fi
+
+    if [ -n "$target_peer" ]; then
+        if [ "$member_count" -lt 3 ]; then
+            print_error "The target is still an etcd member, but only ${member_count} member(s) are visible."
+            print_error "Removing it would destroy quorum; restore a third member first."
+            return 1
+        fi
+        print_info "Old etcd member: ${target_name} -> ${target_peer}"
+        print_warning "Stop ${target_name} or boot it into the Kairos installer before continuing."
+        print_warning "The next step removes this controller from the etcd cluster."
+        read -r -p "Type REMOVE to continue: " confirm_remove || return 1
+        if [ "$confirm_remove" != "REMOVE" ]; then
+            print_info "Controller rebuild cancelled."
+            return 0
+        fi
+
+        if [ "${CONTROLLER_WORKER:-n}" = "y" ] && k0s kubectl get node "$target_name" &>/dev/null; then
+            print_info "Removing the controller-worker Kubernetes node: ${target_name}"
+            k0s kubectl drain "$target_name" --ignore-daemonsets --delete-emptydir-data --force || return 1
+            k0s kubectl delete node "$target_name" --ignore-not-found || return 1
+            k0s kubectl delete controlnode.autopilot.k0sproject.io "$target_name" --ignore-not-found 2>/dev/null || true
+        fi
+
+        print_info "Removing ${target_name} from etcd..."
+        if ! k0s etcd leave --peer-address "$target_peer"; then
+            print_error "Could not remove the old etcd member."
+            return 1
+        fi
+
+        removed="n"
+        for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            member_list_after=$(k0s etcd member-list 2>/dev/null || true)
+            if ! printf '%s\n' "$member_list_after" | grep -Fq "$target_peer"; then
+                removed="y"
+                break
+            fi
+            sleep 1
+        done
+        if [ "$removed" != "y" ]; then
+            print_error "The old etcd member is still listed; stopping before generating a replacement."
+            return 1
+        fi
+        print_successful "Old etcd member removed."
+    else
+        print_warning "${target_name} is not currently listed as an etcd member."
+        read -r -p "Type REBUILD to continue with a new join config: " confirm_remove || return 1
+        if [ "$confirm_remove" != "REBUILD" ]; then
+            print_info "Controller rebuild cancelled."
+            return 0
+        fi
+    fi
+
+    print_info "Creating a fresh controller join token on this surviving controller..."
+    token=$(k0s token create --role=controller --expiry=1h 2>&1)
+    token_status=$?
+    if [ "$token_status" -ne 0 ] || [ -z "$token" ]; then
+        print_error "Failed to create a fresh controller join token."
+        echo "$token"
+        return 1
+    fi
+    printf '%s\n' "$token" > .k0s_controller_token
+    chmod 0600 .k0s_controller_token 2>/dev/null || true
+
+    generate_controller_join_cloudconfig "$token" "$target_ip" "$target_index" || return 1
+    print_successful "Replacement cloud-config ready: controller-join-cloud-config-${target_index}.yaml"
+    print_info "The target must be in the Kairos Web Installer before injection."
+    read -r -p "Send this join config to ${target_ip}:8080 now? (y/n): " inject_now || return 0
+    if [[ "${inject_now:-n}" =~ ^[Yy]$ ]]; then
+        inject_cloudconfig_webinstaller \
+            "controller-join-cloud-config-${target_index}.yaml" "$target_ip"
+    fi
+}
+
+manage_controller_operations() {
+    while true; do
+        echo -e "${YELLOW}======== Controller Join / Rebuild ========${NC}"
+        echo "1. Generate Controller Join Token + Cloud-Configs"
+        echo "2. Rebuild / Replace a Controller (remove etcd member)"
+        echo "3. Back to Main Menu"
+        echo -e "${YELLOW}===========================================${NC}"
+        read -r -p "Enter your choice: " controller_choice || return
+
+        case "$controller_choice" in
+            1) generate_controller_token ;;
+            2) controller_rebuild_workflow ;;
+            3) return ;;
+            *) print_error "Invalid option." ;;
+        esac
+    done
 }
 
 # -----------------------------------------------------------------------------
@@ -7849,7 +8034,7 @@ while true; do
     echo -e "\n${YELLOW}======== Kairos + k0s Cluster Management (v${SCRIPT_VERSION}) ========${NC}"
     echo "1.  Generate Config File (cluster settings + HA VIP)"
     echo "2.  Generate Controller Cloud-Config (first controller)"
-    echo "3.  Generate Controller Join Token + Cloud-Config (primary rejoin + additional controllers)"
+    echo "3.  Controller Join / Rebuild (HA)"
     echo "4.  Generate Worker Token + Cloud-Config (worker nodes)"
     echo "5.  Kairos Web Installer (send config to installer)"
     echo "6.  Generate Kairos Dockerfile (image build)"
@@ -7876,7 +8061,7 @@ while true; do
     case $choice in
         1) generate_config_file ;;
         2) ensure_config && generate_controller_cloudconfig ;;
-        3) ensure_config && generate_controller_token ;;
+        3) ensure_config && manage_controller_operations ;;
         4) ensure_config && generate_worker_token ;;
         5) ensure_config && manage_web_installer ;;
         6) ensure_config && generate_kairos_dockerfile ;;
