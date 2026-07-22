@@ -38,7 +38,7 @@ K0S_CONFIG_PATH="/etc/k0s/k0s.yaml"
 K0S_TOKEN_FILE="/etc/k0s/token"
 KUBELET_ROOT_DIR="/var/lib/kubelet"
 CONTROLLER_MANAGEMENT_KEY_PATH="${HOME}/.ssh/id_ed25519_k0s_controllers"
-EXTERNAL_STORAGE_MOUNTPOINT="/mnt/longhorn-data/disk-1"
+EXTERNAL_STORAGE_MOUNT_ROOT="/mnt/longhorn-data"
 EXTERNAL_STORAGE_PERSISTENT_CONFIG="/usr/local/cloud-config/100-longhorn-data-disk.yaml"
 EXTERNAL_STORAGE_FILESYSTEM="ext4"
 
@@ -50,7 +50,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.92"
+SCRIPT_VERSION="1.0.93"
 
 # Flux bootstrap defaults. These are saved to the cluster config after the
 # first interactive bootstrap so upgrades can reuse the exact same component set.
@@ -7124,13 +7124,14 @@ external_storage_prepare_remote() {
     local node_ip="$1"
     local device="$2"
     local force_format="$3"
+    local mountpoint="$4"
+    local label="${mountpoint##*/}"
 
-    external_storage_run_remote_script "$node_ip" "$device" "$force_format" <<'REMOTE'
+    external_storage_run_remote_script "$node_ip" "$device" "$force_format" "$label" <<'REMOTE'
 set -eu
 device="$1"
 force_format="$2"
-mountpoint="/mnt/longhorn-data/disk-1"
-label="longhorn-data-disk-1"
+label="$3"
 
 for command_name in lsblk blkid mkfs.ext4; do
     command -v "$command_name" >/dev/null 2>&1 || { echo "$command_name is required" >&2; exit 1; }
@@ -7209,21 +7210,91 @@ printf 'LONGHORN_DATA_FILESYSTEM=ext4\n'
 REMOTE
 }
 
-external_storage_render_mount_config() {
+external_storage_get_mountpoint() {
+    local node_ip="$1"
+    local uuid="$2"
+    local mountpoint
+
+    mountpoint=$(external_storage_run_remote_script "$node_ip" \
+        "$EXTERNAL_STORAGE_PERSISTENT_CONFIG" "$uuid" <<'REMOTE'
+set -u
+config="$1"
+uuid="$2"
+mountpoint=""
+
+if [ -r "$config" ]; then
+    mountpoint=$(awk -v uuid="$uuid" '
+        $0 ~ ("device=\"/dev/disk/by-uuid/" uuid "\"") { found=1; next }
+        found && $0 ~ /mountpoint="/ {
+            line=$0
+            sub(/^.*mountpoint="/, "", line)
+            sub(/".*$/, "", line)
+            print line
+            exit
+        }
+    ' "$config")
+fi
+
+if [ -z "$mountpoint" ]; then
+    mountpoint=$(findmnt -rn -S "/dev/disk/by-uuid/$uuid" -o TARGET 2>/dev/null | head -n 1 || true)
+fi
+printf '%s\n' "$mountpoint"
+REMOTE
+    )
+    printf '%s\n' "$mountpoint"
+}
+
+external_storage_next_mountpoint() {
+    local node_ip="$1"
+    local mountpoint
+
+    mountpoint=$(external_storage_run_remote_script "$node_ip" \
+        "$EXTERNAL_STORAGE_PERSISTENT_CONFIG" "$EXTERNAL_STORAGE_MOUNT_ROOT" <<'REMOTE'
+set -u
+config="$1"
+mount_root="$2"
+slot=1
+
+while [ "$slot" -le 999 ]; do
+    candidate="${mount_root}/data-disk-$(printf '%02d' "$slot")"
+    configured=0
+    mounted=0
+    occupied=0
+
+    if [ -r "$config" ] && grep -Fq "mountpoint=\"$candidate\"" "$config"; then
+        configured=1
+    fi
+    mountpoint -q "$candidate" 2>/dev/null && mounted=1
+    if [ -d "$candidate" ] && [ -n "$(find "$candidate" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
+        occupied=1
+    fi
+
+    if [ "$configured" -eq 0 ] && [ "$mounted" -eq 0 ] && [ "$occupied" -eq 0 ]; then
+        printf '%s\n' "$candidate"
+        exit 0
+    fi
+    slot=$((slot + 1))
+done
+
+exit 1
+REMOTE
+    )
+    [ -n "$mountpoint" ] || return 1
+    printf '%s\n' "$mountpoint"
+}
+
+external_storage_render_mount_entry() {
     local uuid="$1"
+    local mountpoint="$2"
+    local disk_name="${mountpoint##*/}"
 
     cat <<EOF
-#cloud-config
-# Managed by kairos-cluster-manager.sh for the external worker data disk.
-# This does not configure Longhorn; Flux owns that configuration.
-stages:
-  boot.after:
-    - name: "Mount external Longhorn data disk"
+    - name: "Mount external Longhorn data disk ${disk_name}"
       commands:
         - |
           set -eu
           device="/dev/disk/by-uuid/${uuid}"
-          mountpoint="${EXTERNAL_STORAGE_MOUNTPOINT}"
+          mountpoint="${mountpoint}"
           if [ ! -e "\$device" ]; then
             echo "External storage disk is not present; skipping \$mountpoint." >&2
             exit 0
@@ -7243,30 +7314,79 @@ stages:
 EOF
 }
 
+external_storage_render_mount_config() {
+    local uuid="$1"
+    local mountpoint="$2"
+
+    cat <<EOF
+#cloud-config
+# Managed by kairos-cluster-manager.sh for external worker data disks.
+# This does not configure Longhorn; Flux owns that configuration.
+stages:
+  boot.after:
+$(external_storage_render_mount_entry "$uuid" "$mountpoint")
+EOF
+}
+
 external_storage_install_mount_config() {
     local node_ip="$1"
     local uuid="$2"
+    local mountpoint="$3"
     local config_content
+    local entry_content
+    local config_encoded
+    local entry_encoded
 
-    config_content=$(external_storage_render_mount_config "$uuid")
-    if external_storage_write_remote_file \
-        "$node_ip" "$EXTERNAL_STORAGE_PERSISTENT_CONFIG" "$config_content"; then
-        print_successful "Persistent mount configuration written on ${node_ip}."
+    config_content=$(external_storage_render_mount_config "$uuid" "$mountpoint")
+    entry_content=$(external_storage_render_mount_entry "$uuid" "$mountpoint")
+    config_encoded=$(printf '%s' "$config_content" | base64 2>/dev/null | tr -d '\r\n')
+    entry_encoded=$(printf '%s' "$entry_content" | base64 2>/dev/null | tr -d '\r\n')
+    if [ -z "$config_encoded" ] || [ -z "$entry_encoded" ]; then
+        print_error "Could not encode the persistent mount configuration."
+        return 1
+    fi
+
+    if external_storage_run_remote_script "$node_ip" \
+        "$EXTERNAL_STORAGE_PERSISTENT_CONFIG" "$uuid" \
+        "$entry_encoded" "$config_encoded" <<'REMOTE'
+set -eu
+config="$1"
+uuid="$2"
+entry_encoded="$3"
+config_encoded="$4"
+
+mkdir -p "$(dirname "$config")"
+if [ -r "$config" ] && grep -Fq "device=\"/dev/disk/by-uuid/$uuid\"" "$config"; then
+    exit 0
+fi
+
+if [ -s "$config" ]; then
+    grep -q '^stages:$' "$config" || { echo "Unexpected existing config format: $config" >&2; exit 1; }
+    grep -q '^  boot.after:$' "$config" || { echo "Unexpected existing boot stages in: $config" >&2; exit 1; }
+    printf '\n%s\n' "$(printf '%s' "$entry_encoded" | base64 -d)" >> "$config"
+else
+    printf '%s' "$config_encoded" | base64 -d > "$config"
+fi
+chmod 0644 "$config"
+REMOTE
+    then
+        print_successful "Persistent mount configuration updated on ${node_ip}: ${mountpoint}."
         return 0
     fi
 
-    print_error "Could not write the persistent mount configuration on ${node_ip}."
+    print_error "Could not update the persistent mount configuration on ${node_ip}."
     return 1
 }
 
 external_storage_mount_remote() {
     local node_ip="$1"
     local uuid="$2"
+    local mountpoint="$3"
 
-    external_storage_run_remote_script "$node_ip" "$uuid" <<'REMOTE'
+    external_storage_run_remote_script "$node_ip" "$uuid" "$mountpoint" <<'REMOTE'
 set -eu
 uuid="$1"
-mountpoint="/mnt/longhorn-data/disk-1"
+mountpoint="$2"
 device="/dev/disk/by-uuid/$uuid"
 
 mkdir -p "$mountpoint"
@@ -7306,47 +7426,71 @@ external_storage_validate_worker() {
     local status
 
     output=$(external_storage_run_remote_script "$node_ip" \
-        "$EXTERNAL_STORAGE_MOUNTPOINT" "$EXTERNAL_STORAGE_PERSISTENT_CONFIG" <<'REMOTE'
+        "$EXTERNAL_STORAGE_PERSISTENT_CONFIG" <<'REMOTE'
 set -u
-mountpoint="$1"
-config="$2"
+config="$1"
 ok=0
 config_status="missing"
-configured_uuid=""
-mount_status="missing"
-mount_source=""
-mount_fstype=""
-mount_uuid=""
-capacity=""
 
 if [ -r "$config" ]; then
     config_status="present"
-    configured_uuid=$(sed -n 's|.*device="/dev/disk/by-uuid/\([^"]*\)".*|\1|p' "$config" | head -n 1)
-fi
-
-if mountpoint -q "$mountpoint" 2>/dev/null; then
-    mount_status="mounted"
-    mount_source=$(findmnt -no SOURCE --target "$mountpoint" 2>/dev/null || true)
-    mount_fstype=$(findmnt -no FSTYPE --target "$mountpoint" 2>/dev/null || true)
-    mount_uuid=$(findmnt -no UUID --target "$mountpoint" 2>/dev/null || true)
-    capacity=$(df -hP "$mountpoint" 2>/dev/null | awk 'NR == 2 {print $2 " total, " $4 " available"}')
+    entries=$(awk '
+        /device="\/dev\/disk\/by-uuid\// {
+            line=$0
+            sub(/^.*device="\/dev\/disk\/by-uuid\//, "", line)
+            sub(/".*$/, "", line)
+            uuid=line
+            next
+        }
+        uuid != "" && /mountpoint="/ {
+            line=$0
+            sub(/^.*mountpoint="/, "", line)
+            sub(/".*$/, "", line)
+            print uuid "\t" line
+            uuid=""
+        }
+    ' "$config")
 else
     ok=1
 fi
 
-[ "$config_status" = "present" ] || ok=1
-if [ -n "$configured_uuid" ] && [ -n "$mount_uuid" ] && [ "$configured_uuid" != "$mount_uuid" ]; then
+if [ -z "${entries:-}" ]; then
     ok=1
-fi
+    printf 'PERSISTENT_CONFIG=%s\n' "$config_status"
+    printf 'DISKS=none\n'
+else
+    while IFS=$'\t' read -r configured_uuid mountpoint; do
+        [ -n "$configured_uuid" ] && [ -n "$mountpoint" ] || continue
+        mount_status="missing"
+        mount_source=""
+        mount_fstype=""
+        mount_uuid=""
+        capacity=""
 
-printf 'MOUNTPOINT=%s\n' "$mountpoint"
-printf 'MOUNT_STATUS=%s\n' "$mount_status"
-printf 'MOUNT_SOURCE=%s\n' "${mount_source:-none}"
-printf 'FILESYSTEM=%s\n' "${mount_fstype:-none}"
-printf 'MOUNT_UUID=%s\n' "${mount_uuid:-none}"
-printf 'PERSISTENT_CONFIG=%s\n' "$config_status"
-printf 'CONFIGURED_UUID=%s\n' "${configured_uuid:-none}"
-printf 'CAPACITY=%s\n' "${capacity:-unavailable}"
+        if mountpoint -q "$mountpoint" 2>/dev/null; then
+            mount_status="mounted"
+            mount_source=$(findmnt -no SOURCE --target "$mountpoint" 2>/dev/null || true)
+            mount_fstype=$(findmnt -no FSTYPE --target "$mountpoint" 2>/dev/null || true)
+            mount_uuid=$(findmnt -no UUID --target "$mountpoint" 2>/dev/null || true)
+            capacity=$(df -hP "$mountpoint" 2>/dev/null | awk 'NR == 2 {print $2 " total, " $4 " available"}')
+        else
+            ok=1
+        fi
+
+        if [ -n "$mount_uuid" ] && [ "$configured_uuid" != "$mount_uuid" ]; then
+            ok=1
+        fi
+
+        printf 'MOUNTPOINT=%s\n' "$mountpoint"
+        printf 'MOUNT_STATUS=%s\n' "$mount_status"
+        printf 'MOUNT_SOURCE=%s\n' "${mount_source:-none}"
+        printf 'FILESYSTEM=%s\n' "${mount_fstype:-none}"
+        printf 'MOUNT_UUID=%s\n' "${mount_uuid:-none}"
+        printf 'CONFIGURED_UUID=%s\n' "$configured_uuid"
+        printf 'CAPACITY=%s\n' "${capacity:-unavailable}"
+    done <<< "$entries"
+    printf 'PERSISTENT_CONFIG=%s\n' "$config_status"
+fi
 exit "$ok"
 REMOTE
     )
@@ -7370,13 +7514,24 @@ external_storage_prepare_worker() {
     local prepare_output
     local status
     local uuid
+    local mountpoint
+    local existing_mountpoint=""
+    local existing_uuid=""
 
     print_info "Preparing external disk for $(external_storage_worker_label "$node_ip") ($node_ip)"
     external_storage_select_device "$node_ip" || return 1
 
     if [ -n "$EXTERNAL_STORAGE_CURRENT_MOUNT" ]; then
-        if [ "$EXTERNAL_STORAGE_CURRENT_MOUNT" = "$EXTERNAL_STORAGE_MOUNTPOINT" ]; then
-            print_info "The selected disk is already mounted at ${EXTERNAL_STORAGE_MOUNTPOINT}."
+        case "$EXTERNAL_STORAGE_CURRENT_MOUNT" in
+            "${EXTERNAL_STORAGE_MOUNT_ROOT}"/disk-[0-9]*|"${EXTERNAL_STORAGE_MOUNT_ROOT}"/data-disk-[0-9][0-9]) ;;
+            *)
+                print_error "The selected disk is already mounted at ${EXTERNAL_STORAGE_CURRENT_MOUNT}."
+                print_info "Unmount it deliberately first, or choose another disk."
+                return 1
+                ;;
+        esac
+        if [ -n "$EXTERNAL_STORAGE_CURRENT_MOUNT" ]; then
+            print_info "The selected disk is already mounted at ${EXTERNAL_STORAGE_CURRENT_MOUNT}."
             data_fstype="${EXTERNAL_STORAGE_PARTITION_FSTYPE:-$EXTERNAL_STORAGE_DISK_FSTYPE}"
             [ "$data_fstype" = "$EXTERNAL_STORAGE_FILESYSTEM" ] || {
                 print_error "The existing mount is not using ${EXTERNAL_STORAGE_FILESYSTEM}."
@@ -7384,16 +7539,22 @@ external_storage_prepare_worker() {
             }
             data_device="${EXTERNAL_STORAGE_PARTITION:-$EXTERNAL_STORAGE_RESOLVED_DEVICE}"
             uuid=$(external_storage_get_uuid "$node_ip" "$data_device") || return 1
-            external_storage_install_mount_config "$node_ip" "$uuid" || return 1
+            mountpoint=$(external_storage_get_mountpoint "$node_ip" "$uuid")
+            mountpoint="${mountpoint:-$EXTERNAL_STORAGE_CURRENT_MOUNT}"
+            external_storage_install_mount_config "$node_ip" "$uuid" "$mountpoint" || return 1
             external_storage_validate_worker "$node_ip"
             return $?
         fi
-        print_error "The selected disk is already mounted at ${EXTERNAL_STORAGE_CURRENT_MOUNT}."
-        print_info "Unmount it deliberately first, or choose another disk."
-        return 1
     fi
 
     data_fstype="${EXTERNAL_STORAGE_PARTITION_FSTYPE:-$EXTERNAL_STORAGE_DISK_FSTYPE}"
+    if [ "$data_fstype" = "$EXTERNAL_STORAGE_FILESYSTEM" ]; then
+        data_device="${EXTERNAL_STORAGE_PARTITION:-$EXTERNAL_STORAGE_RESOLVED_DEVICE}"
+        existing_uuid=$(external_storage_get_uuid "$node_ip" "$data_device" 2>/dev/null || true)
+        if [ -n "$existing_uuid" ]; then
+            existing_mountpoint=$(external_storage_get_mountpoint "$node_ip" "$existing_uuid")
+        fi
+    fi
     if [ "$data_fstype" = "$EXTERNAL_STORAGE_FILESYSTEM" ]; then
         print_info "An existing ${EXTERNAL_STORAGE_FILESYSTEM} filesystem was found."
         read -p "Use it without reformatting? (Y/n): " confirmation || return 1
@@ -7415,9 +7576,18 @@ external_storage_prepare_worker() {
         force_format="y"
     fi
 
+    if [ -n "$existing_mountpoint" ]; then
+        mountpoint="$existing_mountpoint"
+    else
+        mountpoint=$(external_storage_next_mountpoint "$node_ip") || {
+            print_error "Could not allocate a free mount path under ${EXTERNAL_STORAGE_MOUNT_ROOT}."
+            return 1
+        }
+    fi
+    print_info "Assigned mount path: ${mountpoint}"
     print_info "Preparing ${EXTERNAL_STORAGE_RESOLVED_DEVICE} as ${EXTERNAL_STORAGE_FILESYSTEM}."
     prepare_output=$(external_storage_prepare_remote "$node_ip" \
-        "$EXTERNAL_STORAGE_SELECTED_DEVICE" "$force_format")
+        "$EXTERNAL_STORAGE_SELECTED_DEVICE" "$force_format" "$mountpoint")
     status=$?
     echo "$prepare_output"
     if [ "$status" -ne 0 ]; then
@@ -7431,9 +7601,9 @@ external_storage_prepare_worker() {
         return 1
     fi
 
-    external_storage_install_mount_config "$node_ip" "$uuid" || return 1
-    if ! external_storage_mount_remote "$node_ip" "$uuid"; then
-        print_error "The disk was prepared, but could not be mounted at ${EXTERNAL_STORAGE_MOUNTPOINT}."
+    external_storage_install_mount_config "$node_ip" "$uuid" "$mountpoint" || return 1
+    if ! external_storage_mount_remote "$node_ip" "$uuid" "$mountpoint"; then
+        print_error "The disk was prepared, but could not be mounted at ${mountpoint}."
         print_info "Use the mount repair option after checking the worker."
         return 1
     fi
@@ -7446,6 +7616,7 @@ external_storage_repair_worker_mount() {
     local data_device
     local data_fstype
     local uuid
+    local mountpoint
 
     print_info "Configuring external mount for $(external_storage_worker_label "$node_ip") ($node_ip)"
     external_storage_select_device "$node_ip" || return 1
@@ -7456,6 +7627,16 @@ external_storage_repair_worker_mount() {
         return 1
     fi
 
+    if [ -n "$EXTERNAL_STORAGE_CURRENT_MOUNT" ]; then
+        case "$EXTERNAL_STORAGE_CURRENT_MOUNT" in
+            "${EXTERNAL_STORAGE_MOUNT_ROOT}"/disk-[0-9]*|"${EXTERNAL_STORAGE_MOUNT_ROOT}"/data-disk-[0-9][0-9]) ;;
+            *)
+                print_error "The selected disk is mounted at ${EXTERNAL_STORAGE_CURRENT_MOUNT}, outside the managed mount root."
+                return 1
+                ;;
+        esac
+    fi
+
     data_device="${EXTERNAL_STORAGE_PARTITION:-$EXTERNAL_STORAGE_RESOLVED_DEVICE}"
     uuid=$(external_storage_get_uuid "$node_ip" "$data_device")
     if [ $? -ne 0 ] || [ -z "$uuid" ]; then
@@ -7463,9 +7644,18 @@ external_storage_repair_worker_mount() {
         return 1
     fi
 
-    external_storage_install_mount_config "$node_ip" "$uuid" || return 1
-    if ! external_storage_mount_remote "$node_ip" "$uuid"; then
-        print_error "The external disk could not be mounted at ${EXTERNAL_STORAGE_MOUNTPOINT}."
+    mountpoint=$(external_storage_get_mountpoint "$node_ip" "$uuid")
+    mountpoint="${mountpoint:-$EXTERNAL_STORAGE_CURRENT_MOUNT}"
+    if [ -z "$mountpoint" ]; then
+        mountpoint=$(external_storage_next_mountpoint "$node_ip") || {
+            print_error "Could not allocate a free mount path under ${EXTERNAL_STORAGE_MOUNT_ROOT}."
+            return 1
+        }
+    fi
+    print_info "Assigned mount path: ${mountpoint}"
+    external_storage_install_mount_config "$node_ip" "$uuid" "$mountpoint" || return 1
+    if ! external_storage_mount_remote "$node_ip" "$uuid" "$mountpoint"; then
+        print_error "The external disk could not be mounted at ${mountpoint}."
         return 1
     fi
 
@@ -7478,7 +7668,7 @@ external_storage_manage() {
 
     while true; do
         echo -e "${YELLOW}======== External Worker Disk Management (host storage only) ========${NC}"
-        echo "Mount path: ${EXTERNAL_STORAGE_MOUNTPOINT}"
+        echo "Mount root: ${EXTERNAL_STORAGE_MOUNT_ROOT} (data-disk-01, data-disk-02, ...)"
         echo "Persistent config: ${EXTERNAL_STORAGE_PERSISTENT_CONFIG}"
         echo "1. Detect disks on worker nodes"
         echo "2. Prepare or format external disk (V1 / ext4)"
