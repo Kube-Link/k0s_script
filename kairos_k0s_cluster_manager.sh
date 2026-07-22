@@ -38,7 +38,7 @@ K0S_CONFIG_PATH="/etc/k0s/k0s.yaml"
 K0S_TOKEN_FILE="/etc/k0s/token"
 KUBELET_ROOT_DIR="/var/lib/kubelet"
 CONTROLLER_MANAGEMENT_KEY_PATH="${HOME}/.ssh/id_ed25519_k0s_controllers"
-EXTERNAL_STORAGE_MOUNT_ROOT="/mnt/longhorn-data"
+EXTERNAL_STORAGE_MOUNT_ROOT="/usr/local/longhorn-data"
 EXTERNAL_STORAGE_PERSISTENT_CONFIG="/usr/local/cloud-config/100-longhorn-data-disk.yaml"
 EXTERNAL_STORAGE_FILESYSTEM="ext4"
 
@@ -50,7 +50,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.105"
+SCRIPT_VERSION="1.0.106"
 
 # Flux bootstrap defaults. These are saved to the cluster config after the
 # first interactive bootstrap so upgrades can reuse the exact same component set.
@@ -7577,6 +7577,17 @@ REMOTE
     printf '%s\n' "$mountpoint"
 }
 
+external_storage_mountpoint_is_managed() {
+    local mountpoint="$1"
+
+    case "$mountpoint" in
+        "${EXTERNAL_STORAGE_MOUNT_ROOT}"/disk-[0-9]*|"${EXTERNAL_STORAGE_MOUNT_ROOT}"/data-disk-[0-9][0-9])
+            return 0
+            ;;
+    esac
+    return 1
+}
+
 external_storage_render_mount_entry() {
     local uuid="$1"
     local mountpoint="$2"
@@ -7651,6 +7662,43 @@ config_encoded="$4"
 
 mkdir -p "$(dirname "$config")"
 if [ -r "$config" ] && grep -Fq "device=\"/dev/disk/by-uuid/$uuid\"" "$config"; then
+    temporary_config="${config}.tmp.$$"
+    awk -v needle="device=\"/dev/disk/by-uuid/$uuid\"" '
+        function flush_entry(   i) {
+            if (!drop_entry) {
+                for (i = 1; i <= entry_lines; i++) {
+                    print entry[i]
+                }
+            }
+            delete entry
+            entry_lines = 0
+            drop_entry = 0
+        }
+        /^    - name:/ {
+            if (in_entry) {
+                flush_entry()
+            }
+            in_entry = 1
+        }
+        {
+            if (in_entry) {
+                entry[++entry_lines] = $0
+                if (index($0, needle)) {
+                    drop_entry = 1
+                }
+            } else {
+                print
+            }
+        }
+        END {
+            if (in_entry) {
+                flush_entry()
+            }
+        }
+    ' "$config" > "$temporary_config"
+    printf '\n%s\n' "$(printf '%s' "$entry_encoded" | base64 -d)" >> "$temporary_config"
+    mv "$temporary_config" "$config"
+    chmod 0644 "$config"
     exit 0
 fi
 
@@ -7870,9 +7918,12 @@ external_storage_prepare_worker() {
         force_format="y"
     fi
 
-    if [ -n "$existing_mountpoint" ]; then
+    if [ -n "$existing_mountpoint" ] && external_storage_mountpoint_is_managed "$existing_mountpoint"; then
         mountpoint="$existing_mountpoint"
     else
+        if [ -n "$existing_mountpoint" ]; then
+            print_warning "Existing mount path ${existing_mountpoint} is not writable on Kairos; assigning a new path under ${EXTERNAL_STORAGE_MOUNT_ROOT}."
+        fi
         mountpoint=$(external_storage_next_mountpoint "$node_ip") || {
             print_error "Could not allocate a free mount path under ${EXTERNAL_STORAGE_MOUNT_ROOT}."
             return 1
@@ -7940,6 +7991,10 @@ external_storage_repair_worker_mount() {
 
     mountpoint=$(external_storage_get_mountpoint "$node_ip" "$uuid")
     mountpoint="${mountpoint:-$EXTERNAL_STORAGE_CURRENT_MOUNT}"
+    if [ -n "$mountpoint" ] && ! external_storage_mountpoint_is_managed "$mountpoint"; then
+        print_warning "Existing mount path ${mountpoint} is not writable on Kairos; assigning a new path under ${EXTERNAL_STORAGE_MOUNT_ROOT}."
+        mountpoint=""
+    fi
     if [ -z "$mountpoint" ]; then
         mountpoint=$(external_storage_next_mountpoint "$node_ip") || {
             print_error "Could not allocate a free mount path under ${EXTERNAL_STORAGE_MOUNT_ROOT}."
