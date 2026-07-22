@@ -50,7 +50,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.101"
+SCRIPT_VERSION="1.0.102"
 
 # Flux bootstrap defaults. These are saved to the cluster config after the
 # first interactive bootstrap so upgrades can reuse the exact same component set.
@@ -1645,6 +1645,70 @@ controller_rebuild_member_peer() {
     '
 }
 
+controller_rebuild_forget_host_keys() {
+    local target_ip="$1"
+    local target_name="${2:-}"
+    local known_hosts_file="${HOME}/.ssh/known_hosts"
+    local local_controller_ip=""
+    local local_addresses=""
+    local controller_ip
+    local remote_status
+    local -a configured_controllers=("$CONTROLLER_IP" "${ADDITIONAL_CONTROLLERS[@]}")
+
+    print_info "Removing the old SSH host key for ${target_ip} from known_hosts..."
+
+    if command -v ssh-keygen &>/dev/null; then
+        if [ -f "$known_hosts_file" ]; then
+            ssh-keygen -q -R "$target_ip" -f "$known_hosts_file" >/dev/null 2>&1 || true
+            ssh-keygen -q -R "[$target_ip]:22" -f "$known_hosts_file" >/dev/null 2>&1 || true
+            [ -n "$target_name" ] && ssh-keygen -q -R "$target_name" -f "$known_hosts_file" >/dev/null 2>&1 || true
+            print_successful "Local SSH host-key entries removed for ${target_ip}."
+        else
+            print_info "Local known_hosts file does not exist yet."
+        fi
+    else
+        print_warning "ssh-keygen is unavailable; local known_hosts was not changed."
+    fi
+
+    if command -v ip &>/dev/null; then
+        local_addresses=$(ip -4 -o addr show 2>/dev/null)
+        for controller_ip in "${configured_controllers[@]}"; do
+            if ip_output_contains_address "$local_addresses" "$controller_ip"; then
+                local_controller_ip="$controller_ip"
+                break
+            fi
+        done
+    fi
+
+    for controller_ip in "${configured_controllers[@]}"; do
+        [ -n "$controller_ip" ] || continue
+        [ "$controller_ip" = "$target_ip" ] && continue
+        [ "$controller_ip" = "$local_controller_ip" ] && continue
+
+        if command -v external_storage_run_remote_script &>/dev/null; then
+            external_storage_run_remote_script "$controller_ip" "$target_ip" "$target_name" <<'REMOTE'
+target_ip="$1"
+target_name="${2:-}"
+known_hosts_file=/root/.ssh/known_hosts
+
+if command -v ssh-keygen >/dev/null 2>&1 && [ -f "$known_hosts_file" ]; then
+    ssh-keygen -q -R "$target_ip" -f "$known_hosts_file" >/dev/null 2>&1 || true
+    ssh-keygen -q -R "[$target_ip]:22" -f "$known_hosts_file" >/dev/null 2>&1 || true
+    [ -n "$target_name" ] && ssh-keygen -q -R "$target_name" -f "$known_hosts_file" >/dev/null 2>&1 || true
+fi
+REMOTE
+            remote_status=$?
+            if [ "$remote_status" -eq 0 ]; then
+                print_successful "Removed ${target_ip} host-key entries from ${controller_ip}."
+            else
+                print_warning "Could not refresh known_hosts on surviving controller ${controller_ip}."
+            fi
+        fi
+    done
+
+    print_info "The first SSH connection after reinstall must verify and accept the new host fingerprint."
+}
+
 controller_rebuild_workflow() {
     local -a configured_controllers=("$CONTROLLER_IP" "${ADDITIONAL_CONTROLLERS[@]}")
     local selection target_ip target_index target_name target_peer
@@ -1765,6 +1829,7 @@ controller_rebuild_workflow() {
             return 1
         fi
         print_successful "Old etcd member removed."
+        controller_rebuild_forget_host_keys "$target_ip" "$target_name"
     else
         print_warning "${target_name} is not currently listed as an etcd member."
         read -r -p "Type REBUILD to continue with a new join config: " confirm_remove || return 1
@@ -1772,6 +1837,7 @@ controller_rebuild_workflow() {
             print_info "Controller rebuild cancelled."
             return 0
         fi
+        controller_rebuild_forget_host_keys "$target_ip" "$target_name"
     fi
 
     print_info "Creating a fresh controller join token on this surviving controller..."
