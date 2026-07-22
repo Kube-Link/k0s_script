@@ -50,7 +50,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.98"
+SCRIPT_VERSION="1.0.99"
 
 # Flux bootstrap defaults. These are saved to the cluster config after the
 # first interactive bootstrap so upgrades can reuse the exact same component set.
@@ -1647,7 +1647,7 @@ controller_rebuild_workflow() {
     local selection target_ip target_index target_name target_peer
     local local_controller_ip=""
     local member_list member_list_after member_status member_count
-    local token token_status confirm_remove inject_now
+    local token token_status confirm_remove inject_now target_leave_address
     local attempt removed
     local candidate_ip
 
@@ -1725,6 +1725,8 @@ controller_rebuild_workflow() {
             return 1
         fi
         print_info "Old etcd member: ${target_name} -> ${target_peer}"
+        target_leave_address="${target_peer#*://}"
+        target_leave_address="${target_leave_address%%:*}"
         print_warning "Stop ${target_name} or boot it into the Kairos installer before continuing."
         print_warning "The next step removes this controller from the etcd cluster."
         read -r -p "Type REMOVE to continue: " confirm_remove || return 1
@@ -1740,8 +1742,8 @@ controller_rebuild_workflow() {
             k0s kubectl delete controlnode.autopilot.k0sproject.io "$target_name" --ignore-not-found 2>/dev/null || true
         fi
 
-        print_info "Removing ${target_name} from etcd..."
-        if ! k0s etcd leave --peer-address "$target_peer"; then
+        print_info "Removing ${target_name} from etcd using peer address ${target_leave_address}..."
+        if ! k0s etcd leave --peer-address "$target_leave_address"; then
             print_error "Could not remove the old etcd member."
             return 1
         fi
