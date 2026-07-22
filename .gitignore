@@ -4,5 +4,9 @@
 *.yml
 /bgp_config/
 
+# Dedicated controller-management SSH key material (never commit)
+**/id_ed25519_k0s_controllers*
+**/.ssh/id_ed25519_k0s_controllers*
+
 # Reference scripts (not part of this project)
 ref/

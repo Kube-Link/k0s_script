@@ -50,7 +50,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.99"
+SCRIPT_VERSION="1.0.101"
 
 # Flux bootstrap defaults. These are saved to the cluster config after the
 # first interactive bootstrap so upgrades can reuse the exact same component set.
@@ -722,7 +722,7 @@ config_url: \"${CONFIG_URL}\""
     fi
 
     # Controllers share a dedicated management key for status and maintenance checks.
-    prepare_controller_management_key || true
+    prepare_controller_management_key || return 1
 
     # Build SSH keys block (GitHub/user key plus the controller-management key)
     local SSH_KEYS_BLOCK="      - github:${GITHUB_USER}"
@@ -973,6 +973,7 @@ ${CONTROLLER_MANAGEMENT_WRITE_FILES_BLOCK}
       INSTALL_CILIUM=${INSTALL_CILIUM}
       GITHUB_USER=${GITHUB_USER}
       SSH_PUBKEY='${SSH_PUBKEY}'
+      CONTROLLER_MANAGEMENT_KEY_FINGERPRINT=${CONTROLLER_MANAGEMENT_KEY_FINGERPRINT:-}
       FLUX_BOOTSTRAP_MODE=${FLUX_BOOTSTRAP_MODE:-}
       FLUX_GITHUB_OWNER=${FLUX_GITHUB_OWNER:-}
       FLUX_GITHUB_REPOSITORY=${FLUX_GITHUB_REPOSITORY:-}
@@ -1069,7 +1070,7 @@ generate_worker_cloudconfig() {
 
     # Workers authorize the controller-management public key so controller-side
     # diagnostics can inspect their local kubelet configuration over SSH.
-    prepare_controller_management_key || true
+    prepare_controller_management_key || return 1
 
     # Build SSH keys block (github key, user key, and management public key)
     local SSH_KEYS_BLOCK="      - github:${GITHUB_USER}"
@@ -1136,6 +1137,7 @@ write_files:
       INSTALL_CILIUM=${INSTALL_CILIUM}
       GITHUB_USER=${GITHUB_USER}
       SSH_PUBKEY='${SSH_PUBKEY}'
+      CONTROLLER_MANAGEMENT_KEY_FINGERPRINT=${CONTROLLER_MANAGEMENT_KEY_FINGERPRINT:-}
       FLUX_BOOTSTRAP_MODE=${FLUX_BOOTSTRAP_MODE:-}
       FLUX_GITHUB_OWNER=${FLUX_GITHUB_OWNER:-}
       FLUX_GITHUB_REPOSITORY=${FLUX_GITHUB_REPOSITORY:-}
@@ -1328,7 +1330,7 @@ generate_controller_join_cloudconfig() {
     fi
 
     # Use the same dedicated management key on every controller.
-    prepare_controller_management_key || true
+    prepare_controller_management_key || return 1
 
     # Build SSH keys block
     local SSH_KEYS_BLOCK="      - github:${GITHUB_USER}"
@@ -1572,6 +1574,7 @@ ${CONTROLLER_MANAGEMENT_WRITE_FILES_BLOCK}
       INSTALL_CILIUM=${INSTALL_CILIUM}
       GITHUB_USER=${GITHUB_USER}
       SSH_PUBKEY='${SSH_PUBKEY}'
+      CONTROLLER_MANAGEMENT_KEY_FINGERPRINT=${CONTROLLER_MANAGEMENT_KEY_FINGERPRINT:-}
       FLUX_BOOTSTRAP_MODE=${FLUX_BOOTSTRAP_MODE:-}
       FLUX_GITHUB_OWNER=${FLUX_GITHUB_OWNER:-}
       FLUX_GITHUB_REPOSITORY=${FLUX_GITHUB_REPOSITORY:-}
@@ -2798,6 +2801,8 @@ prepare_controller_management_key() {
     local key_dir
     local private_key_b64
     local public_key_b64
+    local actual_fingerprint
+    local expected_fingerprint
 
     CONTROLLER_MANAGEMENT_PUBKEY=""
     CONTROLLER_MANAGEMENT_WRITE_FILES_BLOCK=""
@@ -2812,6 +2817,11 @@ prepare_controller_management_key() {
     chmod 0700 "$key_dir" 2>/dev/null || true
 
     if [ ! -s "$CONTROLLER_MANAGEMENT_KEY_PATH" ]; then
+        if [ -n "${CONTROLLER_MANAGEMENT_KEY_FINGERPRINT:-}" ]; then
+            print_error "The canonical controller-management key is missing: $CONTROLLER_MANAGEMENT_KEY_PATH"
+            print_info "Restore the original private key from the secure backup before generating cloud-configs."
+            return 1
+        fi
         if ! ssh-keygen -q -t ed25519 \
             -f "$CONTROLLER_MANAGEMENT_KEY_PATH" \
             -N "" \
@@ -2828,6 +2838,24 @@ prepare_controller_management_key() {
 
     chmod 0600 "$CONTROLLER_MANAGEMENT_KEY_PATH" 2>/dev/null || true
     chmod 0644 "${CONTROLLER_MANAGEMENT_KEY_PATH}.pub" 2>/dev/null || true
+
+    actual_fingerprint=$(ssh-keygen -lf "${CONTROLLER_MANAGEMENT_KEY_PATH}.pub" -E sha256 2>/dev/null | awk 'NR == 1 {print $2}')
+    if [ -z "$actual_fingerprint" ]; then
+        print_error "Could not calculate the controller-management key fingerprint."
+        return 1
+    fi
+    expected_fingerprint="${CONTROLLER_MANAGEMENT_KEY_FINGERPRINT:-}"
+    if [ -n "$expected_fingerprint" ] && [ "$expected_fingerprint" != "$actual_fingerprint" ]; then
+        print_error "Controller-management key fingerprint does not match the cluster config."
+        print_error "Expected: $expected_fingerprint"
+        print_error "Found:    $actual_fingerprint"
+        return 1
+    fi
+    CONTROLLER_MANAGEMENT_KEY_FINGERPRINT="$actual_fingerprint"
+    if [ -f "$CONFIG_FILE" ]; then
+        upsert_config_value "$CONFIG_FILE" "CONTROLLER_MANAGEMENT_KEY_FINGERPRINT" "$CONTROLLER_MANAGEMENT_KEY_FINGERPRINT"
+        chmod 0600 "$CONFIG_FILE" 2>/dev/null || true
+    fi
 
     CONTROLLER_MANAGEMENT_PUBKEY=$(cat "${CONTROLLER_MANAGEMENT_KEY_PATH}.pub")
     private_key_b64=$(script_base64_lf "$CONTROLLER_MANAGEMENT_KEY_PATH")
