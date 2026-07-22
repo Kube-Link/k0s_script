@@ -50,7 +50,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.96"
+SCRIPT_VERSION="1.0.97"
 
 # Flux bootstrap defaults. These are saved to the cluster config after the
 # first interactive bootstrap so upgrades can reuse the exact same component set.
@@ -7039,7 +7039,7 @@ while [ -n "$root_disk" ]; do
     [ -n "$root_parent" ] || break
     root_disk="/dev/$root_parent"
 done
-printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+printf '%s|%s|%s|%s|%s|%s\n' \
     "$resolved" "$disk_fstype" "$partition" "$partition_fstype" "$current_mount" "$root_disk"
 REMOTE
 }
@@ -7099,7 +7099,7 @@ external_storage_select_device() {
         return 1
     fi
 
-    IFS=$'\t' read -r EXTERNAL_STORAGE_RESOLVED_DEVICE \
+    IFS='|' read -r EXTERNAL_STORAGE_RESOLVED_DEVICE \
         EXTERNAL_STORAGE_DISK_FSTYPE EXTERNAL_STORAGE_PARTITION \
         EXTERNAL_STORAGE_PARTITION_FSTYPE EXTERNAL_STORAGE_CURRENT_MOUNT \
         EXTERNAL_STORAGE_ROOT_DISK <<< "$state"
@@ -7130,12 +7130,16 @@ external_storage_prepare_remote() {
 
     external_storage_run_remote_script "$node_ip" "$device" "$force_format" "$label" "$mountpoint" <<'REMOTE'
 set -eu
-device="$1"
-force_format="$2"
-label="$3"
-mountpoint="$4"
+device="${1:-}"
+force_format="${2:-n}"
+label="${3:-}"
+mountpoint="${4:-}"
 
-for command_name in lsblk blkid mkfs.ext4; do
+[ -n "$device" ] || { echo "No disk device was supplied" >&2; exit 1; }
+[ -n "$label" ] || { echo "No filesystem label was supplied" >&2; exit 1; }
+[ -n "$mountpoint" ] || { echo "No target mountpoint was supplied" >&2; exit 1; }
+
+for command_name in lsblk blkid mkfs.ext4 mountpoint; do
     command -v "$command_name" >/dev/null 2>&1 || { echo "$command_name is required" >&2; exit 1; }
 done
 resolved=$(readlink -f "$device" 2>/dev/null || true)
@@ -7186,7 +7190,11 @@ if [ -z "$data_device" ]; then
     else
         data_device=$(printf '%s\n' "$partition" | head -n 1)
     fi
-    command -v partprobe >/dev/null 2>&1 && partprobe "$resolved" || true
+    if command -v partprobe >/dev/null 2>&1; then
+        partprobe "$resolved" || true
+    elif command -v partx >/dev/null 2>&1; then
+        partx -u "$resolved" || true
+    fi
     command -v udevadm >/dev/null 2>&1 && udevadm settle || true
     if [ -z "$data_device" ]; then
         case "$resolved" in
