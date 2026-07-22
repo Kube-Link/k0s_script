@@ -38,6 +38,9 @@ K0S_CONFIG_PATH="/etc/k0s/k0s.yaml"
 K0S_TOKEN_FILE="/etc/k0s/token"
 KUBELET_ROOT_DIR="/var/lib/kubelet"
 CONTROLLER_MANAGEMENT_KEY_PATH="${HOME}/.ssh/id_ed25519_k0s_controllers"
+EXTERNAL_STORAGE_MOUNTPOINT="/mnt/longhorn-data/disk-1"
+EXTERNAL_STORAGE_PERSISTENT_CONFIG="/usr/local/cloud-config/100-longhorn-data-disk.yaml"
+EXTERNAL_STORAGE_FILESYSTEM="ext4"
 
 # Kairos image defaults
 # TODO: decide on a base image tag strategy (pin to a release or track latest)
@@ -47,7 +50,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.90"
+SCRIPT_VERSION="1.0.92"
 
 # Flux bootstrap defaults. These are saved to the cluster config after the
 # first interactive bootstrap so upgrades can reuse the exact same component set.
@@ -6857,6 +6860,672 @@ EOF
     echo "  kubectl -n $target_namespace get pvc $target_pvc"
 }
 
+external_storage_find_ssh_key() {
+    local candidate_key
+
+    for candidate_key in \
+        "$CONTROLLER_MANAGEMENT_KEY_PATH" \
+        "$HOME/.ssh/id_ed25519_kairos" \
+        "$HOME/.ssh/id_ed25519" \
+        "$HOME/.ssh/id_rsa"; do
+        if [ -r "$candidate_key" ]; then
+            printf '%s\n' "$candidate_key"
+            return 0
+        fi
+    done
+    return 1
+}
+
+external_storage_ssh_command() {
+    local node_ip="$1"
+    local remote_command="$2"
+    local identity_file
+    local output
+    local remote_status
+    local -a ssh_args
+
+    if ! command -v ssh &>/dev/null; then
+        return 127
+    fi
+
+    identity_file=$(external_storage_find_ssh_key 2>/dev/null || true)
+    ssh_args=(-n -T -o BatchMode=yes -o ConnectTimeout=6 -o StrictHostKeyChecking=accept-new)
+    [ -n "$identity_file" ] && ssh_args=(-i "$identity_file" "${ssh_args[@]}")
+    output=$(ssh "${ssh_args[@]}" "root@${node_ip}" "$remote_command" 2>/dev/null)
+    remote_status=$?
+    if [ "$remote_status" -eq 0 ]; then
+        printf '%s\n' "$output"
+        return 0
+    fi
+    return "$remote_status"
+}
+
+external_storage_run_remote_script() {
+    local node_ip="$1"
+    shift
+    local identity_file
+    local -a ssh_args
+
+    if ! command -v ssh &>/dev/null; then
+        return 127
+    fi
+
+    identity_file=$(external_storage_find_ssh_key 2>/dev/null || true)
+    ssh_args=(-T -o BatchMode=yes -o ConnectTimeout=6 -o StrictHostKeyChecking=accept-new)
+    [ -n "$identity_file" ] && ssh_args=(-i "$identity_file" "${ssh_args[@]}")
+    ssh "${ssh_args[@]}" "root@${node_ip}" bash -s -- "$@"
+}
+
+external_storage_write_remote_file() {
+    local node_ip="$1"
+    local destination="$2"
+    local content="$3"
+    local identity_file
+    local encoded
+    local destination_q
+    local -a ssh_args
+
+    encoded=$(printf '%s' "$content" | base64 2>/dev/null | tr -d '\r\n')
+    [ -n "$encoded" ] || return 1
+    printf -v destination_q '%q' "$destination"
+    identity_file=$(external_storage_find_ssh_key 2>/dev/null || true)
+    ssh_args=(-T -o BatchMode=yes -o ConnectTimeout=6 -o StrictHostKeyChecking=accept-new)
+    [ -n "$identity_file" ] && ssh_args=(-i "$identity_file" "${ssh_args[@]}")
+
+    printf '%s' "$encoded" | ssh "${ssh_args[@]}" "root@${node_ip}" \
+        "mkdir -p \"\$(dirname ${destination_q})\" && base64 -d > ${destination_q} && chmod 0644 ${destination_q}" \
+        2>/dev/null
+}
+
+external_storage_worker_label() {
+    local node_ip="$1"
+    local worker_name
+    worker_name=$(worker_hostname_for_ip "$node_ip")
+    [ -n "$worker_name" ] && printf '%s\n' "$worker_name" || printf '%s\n' "worker-${node_ip}"
+}
+
+external_storage_select_workers() {
+    local selection normalized item index i
+    local -a selected_items
+    EXTERNAL_STORAGE_SELECTED_IPS=()
+
+    if [ "${#WORKERS[@]}" -eq 0 ]; then
+        print_warning "No worker IPs are configured. Generate or update the cluster config first."
+        return 1
+    fi
+
+    print_info "Configured worker nodes:"
+    for i in "${!WORKERS[@]}"; do
+        [ -n "${WORKERS[$i]}" ] || continue
+        printf '  %d. %s (%s)\n' "$((i + 1))" \
+            "$(external_storage_worker_label "${WORKERS[$i]}")" "${WORKERS[$i]}"
+    done
+    read -p "Select worker number(s), comma-separated, or A for all: " selection || return 1
+    normalized=$(printf '%s' "$selection" | tr -d '[:space:]')
+
+    case "${normalized,,}" in
+        a|all)
+            for i in "${!WORKERS[@]}"; do
+                [ -n "${WORKERS[$i]}" ] && EXTERNAL_STORAGE_SELECTED_IPS+=("${WORKERS[$i]}")
+            done
+            ;;
+        "") return 1 ;;
+        *)
+            IFS=',' read -ra selected_items <<< "$normalized"
+            for item in "${selected_items[@]}"; do
+                if ! [[ "$item" =~ ^[0-9]+$ ]]; then
+                    print_error "Invalid worker selection: $item"
+                    EXTERNAL_STORAGE_SELECTED_IPS=()
+                    return 1
+                fi
+                index=$((10#$item - 1))
+                if [ "$index" -lt 0 ] || [ "$index" -ge "${#WORKERS[@]}" ] || [ -z "${WORKERS[$index]}" ]; then
+                    print_error "Worker selection is out of range: $item"
+                    EXTERNAL_STORAGE_SELECTED_IPS=()
+                    return 1
+                fi
+                for i in "${!EXTERNAL_STORAGE_SELECTED_IPS[@]}"; do
+                    [ "${EXTERNAL_STORAGE_SELECTED_IPS[$i]}" = "${WORKERS[$index]}" ] || continue
+                    print_error "Worker selected more than once: $item"
+                    EXTERNAL_STORAGE_SELECTED_IPS=()
+                    return 1
+                done
+                EXTERNAL_STORAGE_SELECTED_IPS+=("${WORKERS[$index]}")
+            done
+            ;;
+    esac
+    [ "${#EXTERNAL_STORAGE_SELECTED_IPS[@]}" -gt 0 ]
+}
+
+external_storage_detect_worker() {
+    local node_ip="$1"
+    local listing
+    local status
+
+    print_info "Disk inventory: $(external_storage_worker_label "$node_ip") ($node_ip)"
+    listing=$(external_storage_ssh_command "$node_ip" \
+        "lsblk -e7 -o PATH,TYPE,SIZE,FSTYPE,LABEL,UUID,MOUNTPOINTS,MODEL,SERIAL 2>/dev/null || lsblk -e7 -o PATH,TYPE,SIZE,FSTYPE,LABEL,UUID,MOUNTPOINT,MODEL,SERIAL")
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        print_warning "Could not connect to ${node_ip} over SSH."
+        return 1
+    fi
+    echo "$listing"
+    echo ""
+}
+
+external_storage_device_state() {
+    local node_ip="$1"
+    local device="$2"
+
+    external_storage_run_remote_script "$node_ip" "$device" <<'REMOTE'
+set -u
+device="$1"
+resolved=$(readlink -f "$device" 2>/dev/null || true)
+[ -b "$resolved" ] || exit 1
+disk_fstype=$(lsblk -dnro FSTYPE "$resolved" 2>/dev/null || true)
+partition=$(lsblk -nrpo NAME,TYPE "$resolved" 2>/dev/null | awk '{if ($2 == "part") {print $1; exit}}')
+partition_fstype=""
+[ -n "$partition" ] && partition_fstype=$(lsblk -dnro FSTYPE "$partition" 2>/dev/null || true)
+current_mount=$(lsblk -nrpo MOUNTPOINTS "$resolved" 2>/dev/null | awk 'NF {print; exit}')
+[ -n "$current_mount" ] || current_mount=$(lsblk -nrpo MOUNTPOINT "$resolved" 2>/dev/null | awk 'NF {print; exit}')
+root_source=$(findmnt -n -o SOURCE / 2>/dev/null || true)
+root_disk="$root_source"
+while [ -n "$root_disk" ]; do
+    root_type=$(lsblk -dnro TYPE "$root_disk" 2>/dev/null || true)
+    [ "$root_type" = "disk" ] && break
+    root_parent=$(lsblk -dnro PKNAME "$root_disk" 2>/dev/null || true)
+    [ -n "$root_parent" ] || break
+    root_disk="/dev/$root_parent"
+done
+printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$resolved" "$disk_fstype" "$partition" "$partition_fstype" "$current_mount" "$root_disk"
+REMOTE
+}
+
+external_storage_select_device() {
+    local node_ip="$1"
+    local listing status selection line device state i
+    local -a disk_lines
+
+    EXTERNAL_STORAGE_SELECTED_DEVICE=""
+    EXTERNAL_STORAGE_RESOLVED_DEVICE=""
+    EXTERNAL_STORAGE_DISK_FSTYPE=""
+    EXTERNAL_STORAGE_PARTITION=""
+    EXTERNAL_STORAGE_PARTITION_FSTYPE=""
+    EXTERNAL_STORAGE_CURRENT_MOUNT=""
+    EXTERNAL_STORAGE_ROOT_DISK=""
+
+    listing=$(external_storage_ssh_command "$node_ip" \
+        "lsblk -dpn -o PATH,TYPE,SIZE,MODEL,SERIAL 2>/dev/null | awk '{if (\$2 == \"disk\") print}'")
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        print_warning "Could not connect to ${node_ip} over SSH."
+        return 1
+    fi
+    mapfile -t disk_lines < <(printf '%s\n' "$listing" | awk 'NF')
+    if [ "${#disk_lines[@]}" -eq 0 ]; then
+        print_warning "No block disks were detected on ${node_ip}."
+        return 1
+    fi
+
+    print_info "Detected disks on $(external_storage_worker_label "$node_ip") ($node_ip):"
+    for i in "${!disk_lines[@]}"; do
+        printf '  %d. %s\n' "$((i + 1))" "${disk_lines[$i]}"
+    done
+    read -p "Select a disk number or enter its device path: " selection || return 1
+    selection=$(printf '%s' "$selection" | tr -d '[:space:]')
+    if [[ "$selection" =~ ^[0-9]+$ ]]; then
+        i=$((10#$selection - 1))
+        if [ "$i" -lt 0 ] || [ "$i" -ge "${#disk_lines[@]}" ]; then
+            print_error "Disk selection is out of range."
+            return 1
+        fi
+        line="${disk_lines[$i]}"
+        device="${line%% *}"
+    else
+        device="$selection"
+    fi
+
+    if ! [[ "$device" =~ ^/dev/[A-Za-z0-9._+:/=@-]+$ ]]; then
+        print_error "Invalid device path: $device"
+        return 1
+    fi
+    state=$(external_storage_device_state "$node_ip" "$device")
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        print_error "The selected device could not be inspected: $device"
+        return 1
+    fi
+
+    IFS=$'\t' read -r EXTERNAL_STORAGE_RESOLVED_DEVICE \
+        EXTERNAL_STORAGE_DISK_FSTYPE EXTERNAL_STORAGE_PARTITION \
+        EXTERNAL_STORAGE_PARTITION_FSTYPE EXTERNAL_STORAGE_CURRENT_MOUNT \
+        EXTERNAL_STORAGE_ROOT_DISK <<< "$state"
+    if [ -z "$EXTERNAL_STORAGE_RESOLVED_DEVICE" ]; then
+        print_error "The selected device does not resolve to a block device: $device"
+        return 1
+    fi
+    if [ "$EXTERNAL_STORAGE_RESOLVED_DEVICE" = "$EXTERNAL_STORAGE_ROOT_DISK" ]; then
+        print_error "Refusing to use the root/system disk: $EXTERNAL_STORAGE_RESOLVED_DEVICE"
+        return 1
+    fi
+
+    EXTERNAL_STORAGE_SELECTED_DEVICE="$device"
+    echo "Resolved device: ${EXTERNAL_STORAGE_RESOLVED_DEVICE}"
+    echo "Disk filesystem: ${EXTERNAL_STORAGE_DISK_FSTYPE:-none}"
+    echo "First partition: ${EXTERNAL_STORAGE_PARTITION:-none}"
+    echo "Partition filesystem: ${EXTERNAL_STORAGE_PARTITION_FSTYPE:-none}"
+    echo "Current mount: ${EXTERNAL_STORAGE_CURRENT_MOUNT:-none}"
+    echo "Root disk: ${EXTERNAL_STORAGE_ROOT_DISK:-unknown}"
+}
+
+external_storage_prepare_remote() {
+    local node_ip="$1"
+    local device="$2"
+    local force_format="$3"
+
+    external_storage_run_remote_script "$node_ip" "$device" "$force_format" <<'REMOTE'
+set -eu
+device="$1"
+force_format="$2"
+mountpoint="/mnt/longhorn-data/disk-1"
+label="longhorn-data-disk-1"
+
+for command_name in lsblk blkid mkfs.ext4; do
+    command -v "$command_name" >/dev/null 2>&1 || { echo "$command_name is required" >&2; exit 1; }
+done
+resolved=$(readlink -f "$device" 2>/dev/null || true)
+[ -b "$resolved" ] || { echo "Not a block device: $device" >&2; exit 1; }
+[ "$(lsblk -dnro TYPE "$resolved")" = "disk" ] || { echo "Select a whole disk, not a partition: $resolved" >&2; exit 1; }
+
+root_source=$(findmnt -n -o SOURCE / 2>/dev/null || true)
+root_disk="$root_source"
+while [ -n "$root_disk" ]; do
+    root_type=$(lsblk -dnro TYPE "$root_disk" 2>/dev/null || true)
+    [ "$root_type" = "disk" ] && break
+    root_parent=$(lsblk -dnro PKNAME "$root_disk" 2>/dev/null || true)
+    [ -n "$root_parent" ] || break
+    root_disk="/dev/$root_parent"
+done
+[ "$resolved" != "$root_disk" ] || { echo "Refusing to format the root disk: $resolved" >&2; exit 1; }
+if mountpoint -q "$mountpoint" 2>/dev/null; then
+    echo "The target mountpoint is already mounted; use mount repair instead." >&2
+    exit 1
+fi
+
+disk_fstype=$(lsblk -dnro FSTYPE "$resolved" 2>/dev/null || true)
+partition=$(lsblk -nrpo NAME,TYPE "$resolved" 2>/dev/null | awk '{if ($2 == "part") print $1}')
+partition_count=$(printf '%s\n' "$partition" | awk 'NF {count++} END {print count + 0}')
+data_device=""
+
+if [ "$force_format" != "y" ] && [ "$disk_fstype" = "ext4" ]; then
+    data_device="$resolved"
+elif [ "$force_format" != "y" ] && [ "$partition_count" -eq 1 ]; then
+    first_partition=$(printf '%s\n' "$partition" | head -n 1)
+    if [ "$(lsblk -dnro FSTYPE "$first_partition" 2>/dev/null || true)" = "ext4" ]; then
+        data_device="$first_partition"
+    fi
+fi
+
+if [ -z "$data_device" ]; then
+    [ "$force_format" = "y" ] || { echo "An ext4 filesystem was not found; explicit format confirmation is required." >&2; exit 1; }
+    command -v wipefs >/dev/null 2>&1 || { echo "wipefs is required to prepare the disk" >&2; exit 1; }
+    command -v parted >/dev/null 2>&1 || { echo "parted is required to partition the disk" >&2; exit 1; }
+    if [ "$partition_count" -gt 1 ]; then
+        wipefs -a "$resolved"
+        parted -s "$resolved" mklabel gpt
+        parted -s "$resolved" mkpart primary ext4 1MiB 100%
+    elif [ "$partition_count" -eq 0 ]; then
+        [ -z "$disk_fstype" ] || wipefs -a "$resolved"
+        parted -s "$resolved" mklabel gpt
+        parted -s "$resolved" mkpart primary ext4 1MiB 100%
+    else
+        data_device=$(printf '%s\n' "$partition" | head -n 1)
+    fi
+    command -v partprobe >/dev/null 2>&1 && partprobe "$resolved" || true
+    command -v udevadm >/dev/null 2>&1 && udevadm settle || true
+    if [ -z "$data_device" ]; then
+        case "$resolved" in
+            /dev/nvme*|/dev/mmcblk*) data_device="${resolved}p1" ;;
+            *) data_device="${resolved}1" ;;
+        esac
+    fi
+    attempt=1
+    while [ "$attempt" -le 15 ] && [ ! -b "$data_device" ]; do
+        command -v udevadm >/dev/null 2>&1 && udevadm settle || true
+        sleep 1
+        attempt=$((attempt + 1))
+    done
+    [ -b "$data_device" ] || { echo "The new partition did not appear: $data_device" >&2; exit 1; }
+    mkfs.ext4 -F -L "$label" "$data_device"
+fi
+
+uuid=$(blkid -s UUID -o value "$data_device" 2>/dev/null || true)
+[ -n "$uuid" ] || { echo "Could not read the filesystem UUID from $data_device" >&2; exit 1; }
+printf 'LONGHORN_DATA_DEVICE=%s\n' "$data_device"
+printf 'LONGHORN_DATA_UUID=%s\n' "$uuid"
+printf 'LONGHORN_DATA_FILESYSTEM=ext4\n'
+REMOTE
+}
+
+external_storage_render_mount_config() {
+    local uuid="$1"
+
+    cat <<EOF
+#cloud-config
+# Managed by kairos-cluster-manager.sh for the external worker data disk.
+# This does not configure Longhorn; Flux owns that configuration.
+stages:
+  boot.after:
+    - name: "Mount external Longhorn data disk"
+      commands:
+        - |
+          set -eu
+          device="/dev/disk/by-uuid/${uuid}"
+          mountpoint="${EXTERNAL_STORAGE_MOUNTPOINT}"
+          if [ ! -e "\$device" ]; then
+            echo "External storage disk is not present; skipping \$mountpoint." >&2
+            exit 0
+          fi
+          mkdir -p "\$mountpoint"
+          if mountpoint -q "\$mountpoint"; then
+            current_source="\$(findmnt -no SOURCE --target "\$mountpoint" 2>/dev/null || true)"
+            current_source="\$(readlink -f "\$current_source" 2>/dev/null || true)"
+            expected_source="\$(readlink -f "\$device" 2>/dev/null || true)"
+            if [ "\$current_source" = "\$expected_source" ]; then
+              exit 0
+            fi
+            echo "External storage mountpoint is occupied by \$current_source; expected \$device." >&2
+            exit 1
+          fi
+          mount "\$device" "\$mountpoint"
+EOF
+}
+
+external_storage_install_mount_config() {
+    local node_ip="$1"
+    local uuid="$2"
+    local config_content
+
+    config_content=$(external_storage_render_mount_config "$uuid")
+    if external_storage_write_remote_file \
+        "$node_ip" "$EXTERNAL_STORAGE_PERSISTENT_CONFIG" "$config_content"; then
+        print_successful "Persistent mount configuration written on ${node_ip}."
+        return 0
+    fi
+
+    print_error "Could not write the persistent mount configuration on ${node_ip}."
+    return 1
+}
+
+external_storage_mount_remote() {
+    local node_ip="$1"
+    local uuid="$2"
+
+    external_storage_run_remote_script "$node_ip" "$uuid" <<'REMOTE'
+set -eu
+uuid="$1"
+mountpoint="/mnt/longhorn-data/disk-1"
+device="/dev/disk/by-uuid/$uuid"
+
+mkdir -p "$mountpoint"
+if mountpoint -q "$mountpoint"; then
+    current_source=$(findmnt -no SOURCE --target "$mountpoint" 2>/dev/null || true)
+    current_source=$(readlink -f "$current_source" 2>/dev/null || true)
+    expected_source=$(readlink -f "$device" 2>/dev/null || true)
+    [ "$current_source" = "$expected_source" ] || {
+        echo "Mountpoint is occupied by $current_source; expected $device." >&2
+        exit 1
+    }
+else
+    [ -e "$device" ] || { echo "Filesystem UUID is not present: $uuid" >&2; exit 2; }
+    mount "$device" "$mountpoint"
+fi
+
+findmnt --target "$mountpoint" -o TARGET,SOURCE,FSTYPE,UUID
+REMOTE
+}
+
+external_storage_get_uuid() {
+    local node_ip="$1"
+    local data_device="$2"
+
+    external_storage_run_remote_script "$node_ip" "$data_device" <<'REMOTE'
+set -eu
+device="$1"
+resolved=$(readlink -f "$device" 2>/dev/null || true)
+[ -b "$resolved" ] || exit 1
+blkid -s UUID -o value "$resolved"
+REMOTE
+}
+
+external_storage_validate_worker() {
+    local node_ip="$1"
+    local output
+    local status
+
+    output=$(external_storage_run_remote_script "$node_ip" \
+        "$EXTERNAL_STORAGE_MOUNTPOINT" "$EXTERNAL_STORAGE_PERSISTENT_CONFIG" <<'REMOTE'
+set -u
+mountpoint="$1"
+config="$2"
+ok=0
+config_status="missing"
+configured_uuid=""
+mount_status="missing"
+mount_source=""
+mount_fstype=""
+mount_uuid=""
+capacity=""
+
+if [ -r "$config" ]; then
+    config_status="present"
+    configured_uuid=$(sed -n 's|.*device="/dev/disk/by-uuid/\([^"]*\)".*|\1|p' "$config" | head -n 1)
+fi
+
+if mountpoint -q "$mountpoint" 2>/dev/null; then
+    mount_status="mounted"
+    mount_source=$(findmnt -no SOURCE --target "$mountpoint" 2>/dev/null || true)
+    mount_fstype=$(findmnt -no FSTYPE --target "$mountpoint" 2>/dev/null || true)
+    mount_uuid=$(findmnt -no UUID --target "$mountpoint" 2>/dev/null || true)
+    capacity=$(df -hP "$mountpoint" 2>/dev/null | awk 'NR == 2 {print $2 " total, " $4 " available"}')
+else
+    ok=1
+fi
+
+[ "$config_status" = "present" ] || ok=1
+if [ -n "$configured_uuid" ] && [ -n "$mount_uuid" ] && [ "$configured_uuid" != "$mount_uuid" ]; then
+    ok=1
+fi
+
+printf 'MOUNTPOINT=%s\n' "$mountpoint"
+printf 'MOUNT_STATUS=%s\n' "$mount_status"
+printf 'MOUNT_SOURCE=%s\n' "${mount_source:-none}"
+printf 'FILESYSTEM=%s\n' "${mount_fstype:-none}"
+printf 'MOUNT_UUID=%s\n' "${mount_uuid:-none}"
+printf 'PERSISTENT_CONFIG=%s\n' "$config_status"
+printf 'CONFIGURED_UUID=%s\n' "${configured_uuid:-none}"
+printf 'CAPACITY=%s\n' "${capacity:-unavailable}"
+exit "$ok"
+REMOTE
+    )
+    status=$?
+    if [ "$status" -eq 0 ]; then
+        print_successful "$(external_storage_worker_label "$node_ip") ($node_ip): external disk is mounted and persistent."
+    else
+        print_warning "$(external_storage_worker_label "$node_ip") ($node_ip): external disk needs attention."
+    fi
+    echo "$output"
+    echo ""
+    return "$status"
+}
+
+external_storage_prepare_worker() {
+    local node_ip="$1"
+    local data_fstype
+    local data_device
+    local force_format="n"
+    local confirmation
+    local prepare_output
+    local status
+    local uuid
+
+    print_info "Preparing external disk for $(external_storage_worker_label "$node_ip") ($node_ip)"
+    external_storage_select_device "$node_ip" || return 1
+
+    if [ -n "$EXTERNAL_STORAGE_CURRENT_MOUNT" ]; then
+        if [ "$EXTERNAL_STORAGE_CURRENT_MOUNT" = "$EXTERNAL_STORAGE_MOUNTPOINT" ]; then
+            print_info "The selected disk is already mounted at ${EXTERNAL_STORAGE_MOUNTPOINT}."
+            data_fstype="${EXTERNAL_STORAGE_PARTITION_FSTYPE:-$EXTERNAL_STORAGE_DISK_FSTYPE}"
+            [ "$data_fstype" = "$EXTERNAL_STORAGE_FILESYSTEM" ] || {
+                print_error "The existing mount is not using ${EXTERNAL_STORAGE_FILESYSTEM}."
+                return 1
+            }
+            data_device="${EXTERNAL_STORAGE_PARTITION:-$EXTERNAL_STORAGE_RESOLVED_DEVICE}"
+            uuid=$(external_storage_get_uuid "$node_ip" "$data_device") || return 1
+            external_storage_install_mount_config "$node_ip" "$uuid" || return 1
+            external_storage_validate_worker "$node_ip"
+            return $?
+        fi
+        print_error "The selected disk is already mounted at ${EXTERNAL_STORAGE_CURRENT_MOUNT}."
+        print_info "Unmount it deliberately first, or choose another disk."
+        return 1
+    fi
+
+    data_fstype="${EXTERNAL_STORAGE_PARTITION_FSTYPE:-$EXTERNAL_STORAGE_DISK_FSTYPE}"
+    if [ "$data_fstype" = "$EXTERNAL_STORAGE_FILESYSTEM" ]; then
+        print_info "An existing ${EXTERNAL_STORAGE_FILESYSTEM} filesystem was found."
+        read -p "Use it without reformatting? (Y/n): " confirmation || return 1
+        if [[ "${confirmation:-y}" =~ ^[Nn]$ ]]; then
+            read -p "This will erase the selected disk. Type FORMAT to continue: " confirmation || return 1
+            [ "$confirmation" = "FORMAT" ] || {
+                print_info "Disk preparation cancelled."
+                return 0
+            }
+            force_format="y"
+        fi
+    else
+        print_warning "No usable ${EXTERNAL_STORAGE_FILESYSTEM} filesystem was found."
+        read -p "This will erase the selected disk. Type FORMAT to continue: " confirmation || return 1
+        [ "$confirmation" = "FORMAT" ] || {
+            print_info "Disk preparation cancelled."
+            return 0
+        }
+        force_format="y"
+    fi
+
+    print_info "Preparing ${EXTERNAL_STORAGE_RESOLVED_DEVICE} as ${EXTERNAL_STORAGE_FILESYSTEM}."
+    prepare_output=$(external_storage_prepare_remote "$node_ip" \
+        "$EXTERNAL_STORAGE_SELECTED_DEVICE" "$force_format")
+    status=$?
+    echo "$prepare_output"
+    if [ "$status" -ne 0 ]; then
+        print_error "External disk preparation failed on ${node_ip}."
+        return 1
+    fi
+
+    uuid=$(printf '%s\n' "$prepare_output" | sed -n 's/^LONGHORN_DATA_UUID=//p' | tail -n 1)
+    if [ -z "$uuid" ]; then
+        print_error "The prepared disk UUID could not be read."
+        return 1
+    fi
+
+    external_storage_install_mount_config "$node_ip" "$uuid" || return 1
+    if ! external_storage_mount_remote "$node_ip" "$uuid"; then
+        print_error "The disk was prepared, but could not be mounted at ${EXTERNAL_STORAGE_MOUNTPOINT}."
+        print_info "Use the mount repair option after checking the worker."
+        return 1
+    fi
+
+    external_storage_validate_worker "$node_ip"
+}
+
+external_storage_repair_worker_mount() {
+    local node_ip="$1"
+    local data_device
+    local data_fstype
+    local uuid
+
+    print_info "Configuring external mount for $(external_storage_worker_label "$node_ip") ($node_ip)"
+    external_storage_select_device "$node_ip" || return 1
+    data_fstype="${EXTERNAL_STORAGE_PARTITION_FSTYPE:-$EXTERNAL_STORAGE_DISK_FSTYPE}"
+    if [ "$data_fstype" != "$EXTERNAL_STORAGE_FILESYSTEM" ]; then
+        print_error "The selected disk does not contain an ${EXTERNAL_STORAGE_FILESYSTEM} filesystem."
+        print_info "Use the prepare and format option first, or select another disk."
+        return 1
+    fi
+
+    data_device="${EXTERNAL_STORAGE_PARTITION:-$EXTERNAL_STORAGE_RESOLVED_DEVICE}"
+    uuid=$(external_storage_get_uuid "$node_ip" "$data_device")
+    if [ $? -ne 0 ] || [ -z "$uuid" ]; then
+        print_error "Could not read the filesystem UUID from ${data_device}."
+        return 1
+    fi
+
+    external_storage_install_mount_config "$node_ip" "$uuid" || return 1
+    if ! external_storage_mount_remote "$node_ip" "$uuid"; then
+        print_error "The external disk could not be mounted at ${EXTERNAL_STORAGE_MOUNTPOINT}."
+        return 1
+    fi
+
+    external_storage_validate_worker "$node_ip"
+}
+
+external_storage_manage() {
+    local node_ip
+    local failed
+
+    while true; do
+        echo -e "${YELLOW}======== External Worker Disk Management (host storage only) ========${NC}"
+        echo "Mount path: ${EXTERNAL_STORAGE_MOUNTPOINT}"
+        echo "Persistent config: ${EXTERNAL_STORAGE_PERSISTENT_CONFIG}"
+        echo "1. Detect disks on worker nodes"
+        echo "2. Prepare or format external disk (V1 / ext4)"
+        echo "3. Configure or repair external mount"
+        echo "4. Validate external disk status"
+        echo "5. Back to Longhorn Menu"
+        echo -e "${YELLOW}====================================================================${NC}"
+        read -p "Enter your choice: " external_storage_choice
+
+        case "$external_storage_choice" in
+            1)
+                external_storage_select_workers || continue
+                for node_ip in "${EXTERNAL_STORAGE_SELECTED_IPS[@]}"; do
+                    external_storage_detect_worker "$node_ip"
+                done
+                ;;
+            2)
+                external_storage_select_workers || continue
+                failed=0
+                for node_ip in "${EXTERNAL_STORAGE_SELECTED_IPS[@]}"; do
+                    external_storage_prepare_worker "$node_ip" || failed=1
+                done
+                [ "$failed" -eq 0 ] || print_warning "One or more workers need attention."
+                ;;
+            3)
+                external_storage_select_workers || continue
+                failed=0
+                for node_ip in "${EXTERNAL_STORAGE_SELECTED_IPS[@]}"; do
+                    external_storage_repair_worker_mount "$node_ip" || failed=1
+                done
+                [ "$failed" -eq 0 ] || print_warning "One or more workers need attention."
+                ;;
+            4)
+                external_storage_select_workers || continue
+                failed=0
+                for node_ip in "${EXTERNAL_STORAGE_SELECTED_IPS[@]}"; do
+                    external_storage_validate_worker "$node_ip" || failed=1
+                done
+                [ "$failed" -eq 0 ] || print_warning "One or more workers need attention."
+                ;;
+            5) return ;;
+            "") continue ;;
+            *) print_error "Invalid option." ;;
+        esac
+    done
+}
+
 manage_longhorn() {
     while true; do
         echo -e "${YELLOW}======== Longhorn Backup / Restore ========${NC}"
@@ -6987,15 +7656,16 @@ while true; do
     echo "7.  Manage Cilium (install / upgrade / status)"
     echo "8.  Manage FluxCD"
     echo "9.  Manage Longhorn Backups / Restore"
-    echo "10. Manage BGP Configuration"
-    echo "11. Check Versions"
-    echo "12. Cluster Status / Diagnostics"
-    echo "13. Reset Node"
-    echo "14. Rolling OS Upgrade (A/B)"
-    echo "15. Update Script Now (no reboot)"
-    echo "16. Show Config File"
-    echo "17. Cat Kubeconfig"
-    echo "18. Exit"
+    echo "10. Manage Host / Worker Disks"
+    echo "11. Manage BGP Configuration"
+    echo "12. Check Versions"
+    echo "13. Cluster Status / Diagnostics"
+    echo "14. Reset Node"
+    echo "15. Rolling OS Upgrade (A/B)"
+    echo "16. Update Script Now (no reboot)"
+    echo "17. Show Config File"
+    echo "18. Cat Kubeconfig"
+    echo "19. Exit"
     echo -e "${YELLOW}=================================================${NC}"
     if ! read -p "Enter your choice: " choice; then
         echo ""
@@ -7012,16 +7682,17 @@ while true; do
         6) ensure_config && generate_kairos_dockerfile ;;
         7) manage_cilium ;;
         8) manage_flux ;;
-        9) manage_longhorn ;;
-        10) manage_bgp ;;
-        11) check_versions ;;
-        12) ensure_config && manage_cluster_status ;;
-        13) reset_node ;;
-        14) kairos_rolling_upgrade ;;
-        15) update_script_now ;;
-        16) show_config_file ;;
-        17) show_kubeconfig ;;
-        18) echo "Exiting..."; exit 0 ;;
+        9) ensure_config && manage_longhorn ;;
+        10) ensure_config && external_storage_manage ;;
+        11) manage_bgp ;;
+        12) check_versions ;;
+        13) ensure_config && manage_cluster_status ;;
+        14) reset_node ;;
+        15) kairos_rolling_upgrade ;;
+        16) update_script_now ;;
+        17) show_config_file ;;
+        18) show_kubeconfig ;;
+        19) echo "Exiting..."; exit 0 ;;
         "") continue ;;
         *) print_error "Invalid option." ;;
     esac
