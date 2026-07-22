@@ -50,7 +50,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.95"
+SCRIPT_VERSION="1.0.96"
 
 # Flux bootstrap defaults. These are saved to the cluster config after the
 # first interactive bootstrap so upgrades can reuse the exact same component set.
@@ -1230,7 +1230,8 @@ generate_worker_token() {
 # -----------------------------------------------------------------------------
 # Controller join token + cloud-config (HA) — runs on the first controller.
 # Reuses an existing .k0s_controller_token if present; otherwise generates a new one.
-# Produces one cloud-config per additional controller: controller-join-cloud-config-<index>.yaml
+# Produces one cloud-config per controller: controller-join-cloud-config-<index>.yaml.
+# The primary controller file is for rejoining an existing HA cluster after a rebuild.
 generate_controller_token() {
     print_info "Generating controller join token + cloud-config..."
 
@@ -1256,26 +1257,26 @@ generate_controller_token() {
         echo "$token" > .k0s_controller_token
     fi
 
-    # Generate one config per additional controller IP
-    if [ ${#ADDITIONAL_CONTROLLERS[@]} -eq 0 ]; then
-        print_warning "No additional controller IPs defined in config — nothing to generate."
-        return 0
-    fi
-
     local i
     local generated_files=()
+
+    # Generate a join config for the primary as well. This is intentionally
+    # separate from option 2, which bootstraps a brand-new cluster.
+    generate_controller_join_cloudconfig "$token" "$CONTROLLER_IP" "1"
+    generated_files+=("controller-join-cloud-config-1.yaml")
+
     for i in "${!ADDITIONAL_CONTROLLERS[@]}"; do
         generate_controller_join_cloudconfig "$token" "${ADDITIONAL_CONTROLLERS[$i]}" "$((i + 2))"
         generated_files+=("controller-join-cloud-config-$((i + 2)).yaml")
     done
 
-    print_successful "All controller join cloud-configs generated."
+    print_successful "Controller join cloud-configs generated."
     print_info "Files: ${generated_files[*]}"
-    print_info "Next: use main menu option 5 -> 2 for one additional controller, or option 5 -> 3 for all additional controllers."
 }
 
-# Generates a cloud-config for one additional HA controller that joins the cluster.
-# Called by generate_controller_token() once per additional controller IP.
+# Generates a cloud-config for a controller that joins an existing HA cluster.
+# The primary controller (index 1) uses this for a rebuild/reinstall; additional
+# controllers use it for their initial join.
 # Parameters: $1 = join token, $2 = this node's IP address, $3 = controller index
 generate_controller_join_cloudconfig() {
     local CTRL_TOKEN="$1"
@@ -1346,7 +1347,7 @@ generate_controller_join_cloudconfig() {
 
     cat > "$OUTPUT_FILE" << EOF
 #cloud-config
-# Additional controller node cloud-config for Kairos + k0s (HA join)
+# Controller join cloud-config for Kairos + k0s (HA rejoin or additional controller)
 # Generated for: ${NODE_HOSTNAME} (${NODE_IP})
 # The provider detects /etc/k0s/token and joins instead of init.
 # Reference: https://kairos.io/docs/reference/configuration/
@@ -7840,7 +7841,7 @@ while true; do
     echo -e "\n${YELLOW}======== Kairos + k0s Cluster Management (v${SCRIPT_VERSION}) ========${NC}"
     echo "1.  Generate Config File (cluster settings + HA VIP)"
     echo "2.  Generate Controller Cloud-Config (first controller)"
-    echo "3.  Generate Controller Join Token + Cloud-Config (additional controllers)"
+    echo "3.  Generate Controller Join Token + Cloud-Config (primary rejoin + additional controllers)"
     echo "4.  Generate Worker Token + Cloud-Config (worker nodes)"
     echo "5.  Kairos Web Installer (send config to installer)"
     echo "6.  Generate Kairos Dockerfile (image build)"
