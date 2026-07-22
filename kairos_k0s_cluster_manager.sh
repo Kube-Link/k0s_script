@@ -50,7 +50,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.102"
+SCRIPT_VERSION="1.0.105"
 
 # Flux bootstrap defaults. These are saved to the cluster config after the
 # first interactive bootstrap so upgrades can reuse the exact same component set.
@@ -7446,6 +7446,7 @@ disk_fstype=$(lsblk -dnro FSTYPE "$resolved" 2>/dev/null || true)
 partition=$(lsblk -nrpo NAME,TYPE "$resolved" 2>/dev/null | awk '{if ($2 == "part") print $1}')
 partition_count=$(printf '%s\n' "$partition" | awk 'NF {count++} END {print count + 0}')
 data_device=""
+format_data_device="n"
 
 if [ "$force_format" != "y" ] && [ "$disk_fstype" = "ext4" ]; then
     data_device="$resolved"
@@ -7459,18 +7460,17 @@ fi
 if [ -z "$data_device" ]; then
     [ "$force_format" = "y" ] || { echo "An ext4 filesystem was not found; explicit format confirmation is required." >&2; exit 1; }
     command -v wipefs >/dev/null 2>&1 || { echo "wipefs is required to prepare the disk" >&2; exit 1; }
-    command -v parted >/dev/null 2>&1 || { echo "parted is required to partition the disk" >&2; exit 1; }
+    command -v sfdisk >/dev/null 2>&1 || { echo "sfdisk is required to partition the disk; partx only refreshes the kernel partition table" >&2; exit 1; }
     if [ "$partition_count" -gt 1 ]; then
         wipefs -a "$resolved"
-        parted -s "$resolved" mklabel gpt
-        parted -s "$resolved" mkpart primary ext4 1MiB 100%
+        printf 'label: gpt\n,+,L\n' | sfdisk --wipe always "$resolved"
     elif [ "$partition_count" -eq 0 ]; then
         [ -z "$disk_fstype" ] || wipefs -a "$resolved"
-        parted -s "$resolved" mklabel gpt
-        parted -s "$resolved" mkpart primary ext4 1MiB 100%
+        printf 'label: gpt\n,+,L\n' | sfdisk --wipe always "$resolved"
     else
         data_device=$(printf '%s\n' "$partition" | head -n 1)
     fi
+    format_data_device="y"
     if command -v partprobe >/dev/null 2>&1; then
         partprobe "$resolved" || true
     elif command -v partx >/dev/null 2>&1; then
@@ -7490,6 +7490,9 @@ if [ -z "$data_device" ]; then
         attempt=$((attempt + 1))
     done
     [ -b "$data_device" ] || { echo "The new partition did not appear: $data_device" >&2; exit 1; }
+fi
+
+if [ "$format_data_device" = "y" ]; then
     mkfs.ext4 -F -L "$label" "$data_device"
 fi
 
