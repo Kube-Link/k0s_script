@@ -50,7 +50,7 @@ KAIROS_IMAGE_VERSION="v4.1.2"                   # TODO: make this configurable
 K0S_PROVIDER_VERSION="latest"                   # k0s version baked into image
 
 # Script version — bump manually when making changes; compared against VERSION file in repo
-SCRIPT_VERSION="1.0.106"
+SCRIPT_VERSION="1.0.107"
 
 # Flux bootstrap defaults. These are saved to the cluster config after the
 # first interactive bootstrap so upgrades can reuse the exact same component set.
@@ -5847,6 +5847,16 @@ longhorn_restore_volume_name() {
     printf '%s' "$source_volume"
 }
 
+longhorn_k8s_access_mode() {
+    local access_mode="${1,,}"
+
+    case "$access_mode" in
+        rwo) printf '%s' "ReadWriteOnce" ;;
+        rwx) printf '%s' "ReadWriteMany" ;;
+        *) return 1 ;;
+    esac
+}
+
 longhorn_find_restore_volume_handle() {
     local backup_url="$1"
     local backup_size="$2"
@@ -6010,7 +6020,7 @@ longhorn_restore_batch_volume() {
     local unmap_mark_snap_chain_removed="${LONGHORN_BATCH_UNMAP_MARK_SNAP_CHAIN_REMOVED[$index]}"
     local stale_replica_timeout="${LONGHORN_BATCH_STALE_REPLICA_TIMEOUTS[$index]}"
     local prefix state_file volume_manifest binding_manifest restored_handle restored_phase
-    local access_modes_yaml
+    local access_modes_yaml k8s_access_mode
     local original_reclaim_policy
 
     original_reclaim_policy=$(longhorn_kubectl get pv "$pv" \
@@ -6025,7 +6035,11 @@ longhorn_restore_batch_volume() {
     disable_revision_counter=${disable_revision_counter:-true}
     unmap_mark_snap_chain_removed=${unmap_mark_snap_chain_removed:-ignored}
     stale_replica_timeout=${stale_replica_timeout:-30}
-    access_modes_yaml=$(printf '%s\n' "$pv_access_modes" | sed '/^$/d; s/^/    - /')
+    k8s_access_mode=$(longhorn_k8s_access_mode "$access") || {
+        print_error "Unsupported Longhorn access mode for ${namespace}/${pvc}: ${access:-<empty>}"
+        return 1
+    }
+    access_modes_yaml="    - ${k8s_access_mode}"
 
     prefix=$(sanitize_k8s_name "$namespace-$pvc-$backup")
     state_file="./longhorn-existing-restore-$prefix.state"
@@ -6062,22 +6076,63 @@ longhorn_restore_batch_volume() {
     longhorn_kubectl get pvc "$pvc" -n "$namespace" -o yaml >> "$state_file" 2>/dev/null || true
     longhorn_kubectl get pv "$pv" -o yaml >> "$state_file" 2>/dev/null || true
 
+        cat > "$binding_manifest" << EOF
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+    name: ${pv}
+    annotations:
+        pv.kubernetes.io/provisioned-by: driver.longhorn.io
+spec:
+    capacity:
+        storage: ${pv_capacity}
+    volumeMode: ${volume_mode}
+    accessModes:
+${access_modes_yaml}
+    persistentVolumeReclaimPolicy: ${original_reclaim_policy}
+    storageClassName: ${storage_class}
+    csi:
+        driver: driver.longhorn.io
+        fsType: ${fs_type}
+        volumeAttributes:
+            backupTargetName: "${backup_target}"
+            dataLocality: "${data_locality}"
+            dataEngine: "${engine}"
+            disableRevisionCounter: "${disable_revision_counter}"
+            numberOfReplicas: "${replicas}"
+            staleReplicaTimeout: "${stale_replica_timeout}"
+            unmapMarkSnapChainRemoved: "${unmap_mark_snap_chain_removed}"
+        volumeHandle: ${restore_handle}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+    name: ${pvc}
+    namespace: ${namespace}
+spec:
+    accessModes:
+${access_modes_yaml}
+    storageClassName: ${storage_class}
+    volumeName: ${pv}
+    volumeMode: ${volume_mode}
+    resources:
+        requests:
+            storage: ${requested_size}
+EOF
+
     if [ "$old_handle" = "$restore_handle" ]; then
         if ! longhorn_validate_existing_pv_pvc_binding "$namespace" "$pvc" "$pv" "$restore_handle"; then
             print_error "${namespace}/${pvc} already uses restore handle ${restore_handle}, but its PV/PVC binding is invalid."
             return 1
         fi
-        print_info "${namespace}/${pvc} is already rebound; refreshing external PVC field ownership."
-        if ! longhorn_kubectl apply --field-manager=flux-client-side-apply -f "$binding_manifest"; then
-            print_error "Could not refresh external field ownership for ${namespace}/${pvc}."
-            return 1
+            local existing_access_mode
+            existing_access_mode=$(longhorn_kubectl get pvc "$pvc" -n "$namespace" \
+                -o jsonpath='{.spec.accessModes[0]}' 2>/dev/null)
+            if [ "$existing_access_mode" = "$k8s_access_mode" ]; then
+                print_successful "Restored binding already matches ${k8s_access_mode} for $namespace/$pvc -> $pv -> $restore_handle"
+                return 0
         fi
-        if ! longhorn_validate_existing_pv_pvc_binding "$namespace" "$pvc" "$pv" "$restore_handle"; then
-            print_error "PV/PVC binding validation failed after refreshing ${namespace}/${pvc}."
-            return 1
-        fi
-        print_successful "Refreshed restored binding for $namespace/$pvc -> $pv -> $restore_handle"
-        return 0
+            print_info "Rebinding ${namespace}/${pvc} from ${existing_access_mode:-unknown} to ${k8s_access_mode}."
     fi
 
     print_info "Rebinding $namespace/$pvc from ${old_handle} to restored volume ${restore_handle}..."
@@ -6099,7 +6154,7 @@ longhorn_restore_batch_volume() {
         return 1
     fi
 
-    if longhorn_kubectl get volume "$old_handle" -n longhorn-system &>/dev/null; then
+    if [ "$old_handle" != "$restore_handle" ] && longhorn_kubectl get volume "$old_handle" -n longhorn-system &>/dev/null; then
         if ! longhorn_kubectl delete volume "$old_handle" -n longhorn-system --wait=true --timeout=180s; then
             print_error "Could not delete the old Longhorn volume ${old_handle}."
             print_warning "PVC ${namespace}/${pvc} was deleted and Flux remains suspended for manual recovery."
@@ -6124,50 +6179,6 @@ longhorn_restore_batch_volume() {
             return 1
         fi
     fi
-
-    cat > "$binding_manifest" << EOF
-apiVersion: v1
-kind: PersistentVolume
-metadata:
-  name: ${pv}
-  annotations:
-    pv.kubernetes.io/provisioned-by: driver.longhorn.io
-spec:
-  capacity:
-    storage: ${pv_capacity}
-  volumeMode: ${volume_mode}
-  accessModes:
-${access_modes_yaml}
-  persistentVolumeReclaimPolicy: ${original_reclaim_policy}
-  storageClassName: ${storage_class}
-  csi:
-    driver: driver.longhorn.io
-    fsType: ${fs_type}
-    volumeAttributes:
-      backupTargetName: "${backup_target}"
-      dataLocality: "${data_locality}"
-      dataEngine: "${engine}"
-      disableRevisionCounter: "${disable_revision_counter}"
-      numberOfReplicas: "${replicas}"
-      staleReplicaTimeout: "${stale_replica_timeout}"
-      unmapMarkSnapChainRemoved: "${unmap_mark_snap_chain_removed}"
-    volumeHandle: ${restore_handle}
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: ${pvc}
-  namespace: ${namespace}
-spec:
-  accessModes:
-${access_modes_yaml}
-  storageClassName: ${storage_class}
-  volumeName: ${pv}
-  volumeMode: ${volume_mode}
-  resources:
-    requests:
-      storage: ${requested_size}
-EOF
 
     if ! longhorn_kubectl apply --field-manager=flux-client-side-apply -f "$binding_manifest"; then
         print_error "Could not create the replacement PV/PVC binding for ${namespace}/${pvc}."
@@ -6832,7 +6843,7 @@ longhorn_restore_into_existing_pvc_impl() {
     LONGHORN_BATCH_SIZES=("$selected_backup_size")
     LONGHORN_BATCH_REPLICAS=("$current_volume_replicas")
     LONGHORN_BATCH_ENGINES=("$current_volume_engine")
-    LONGHORN_BATCH_ACCESS_MODES=("$current_volume_access_mode")
+    LONGHORN_BATCH_ACCESS_MODES=("${selected_access_mode:-$current_volume_access_mode}")
     LONGHORN_BATCH_STORAGE_CLASSES=("$pvc_storage_class")
     LONGHORN_BATCH_PV_CAPACITIES=("$pv_capacity")
     LONGHORN_BATCH_REQUESTED_SIZES=("$requested_size")
